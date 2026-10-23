@@ -1,0 +1,13 @@
+# Herramientas externas que Cyberia usa y que se instalan con pip (Python 3.9 o más nuevo).
+#
+#   pip install -r requirements.txt
+#
+# Lo más cómodo es ejecutar  ./scripts/setup.sh  (en Windows, desde Git Bash): instala esto
+# y además Go, Node, ffmpeg y la CLI de Wails, y prepara el proyecto.
+
+# Descargador. Opcional: la app baja y actualiza su propia copia en el primer arranque.
+yt-dlp>=2025.1.1
+
+# ffmpeg portátil. Solo se usa si no tienes ffmpeg instalado con brew / winget:
+# scripts/setup.sh copia este binario a la carpeta de datos de la app, donde ella lo encuentra sola.
+imageio-ffmpeg>=0.5.1
