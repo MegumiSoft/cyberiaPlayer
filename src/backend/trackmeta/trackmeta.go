@@ -14,7 +14,7 @@ import (
 )
 
 // AnalysisVersion sube cuando cambia el algoritmo: los análisis guardados con otra versión se descartan.
-const AnalysisVersion = 2
+const AnalysisVersion = 3
 
 // MaxCues es el límite de cues por canción (8 hot cues + memory cues).
 const MaxCues = 40
@@ -29,15 +29,17 @@ type Cue struct {
 
 // Analysis es lo detectado automáticamente.
 type Analysis struct {
-	Size       int64   `json:"size"` // tamaño del archivo cuando se analizó: si cambia, el análisis ya no vale
-	Version    int     `json:"version"`
-	Duration   float64 `json:"duration"`
-	BPM        float64 `json:"bpm"`
-	BeatOffset float64 `json:"beatOffset"` // segundos hasta el primer pulso
-	KeyPC      int     `json:"keyPc"`
-	KeyMinor   bool    `json:"keyMinor"`
-	KeyConf    float64 `json:"keyConf"`
-	HasKey     bool    `json:"hasKey"`
+	Size       int64     `json:"size"` // tamaño del archivo cuando se analizó: si cambia, el análisis ya no vale
+	Version    int       `json:"version"`
+	Duration   float64   `json:"duration"`
+	BPM        float64   `json:"bpm"`
+	BpmConf    float64   `json:"bpmConf"`          // 0..1: seguridad del BPM (bajo = conviene revisarlo)
+	BpmAlt     []float64 `json:"bpmAlt,omitempty"` // otros tempos plausibles
+	BeatOffset float64   `json:"beatOffset"`       // segundos hasta el primer pulso
+	KeyPC      int       `json:"keyPc"`
+	KeyMinor   bool      `json:"keyMinor"`
+	KeyConf    float64   `json:"keyConf"`
+	HasKey     bool      `json:"hasKey"`
 }
 
 // Meta reúne el análisis y las ediciones del usuario.
@@ -214,6 +216,27 @@ func (s *Store) Rename(oldRel, newRel string) error {
 	}
 	delete(s.m, oldRel)
 	s.m[newRel] = m
+	return s.save()
+}
+
+// Copy duplica los metadatos (análisis, rejilla, cues) y la forma de onda de una canción para su copia en otra ruta.
+func (s *Store) Copy(srcRel, dstRel string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	m, ok := s.m[srcRel]
+	if !ok || srcRel == dstRel {
+		return nil
+	}
+	c := m
+	c.Cues = append([]Cue(nil), m.Cues...)
+	if m.Analysis != nil {
+		a := *m.Analysis
+		c.Analysis = &a
+		if data, err := os.ReadFile(s.waveFile(srcRel, a.Size)); err == nil {
+			_ = os.WriteFile(s.waveFile(dstRel, a.Size), data, 0o644)
+		}
+	}
+	s.m[dstRel] = c
 	return s.save()
 }
 

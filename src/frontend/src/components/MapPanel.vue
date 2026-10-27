@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { formatDuration } from '../format'
+import { api } from '../api'
+import { errorText, formatDuration } from '../format'
 import { keyText } from '../player/analysis'
 import { current, libraryToQueue, player, playIndex, setQueue } from '../player/engine'
 import { compatScore, RELATION_LABEL, wheel, type Relation } from '../player/harmony'
@@ -325,6 +326,35 @@ function transition(i: number): string {
   const c = compatScore(a, b, 100)
   return c.rel ? `${RELATION_LABEL[c.rel]} · ${c.pct > 0 ? '+' : ''}${c.pct.toFixed(1)} %` : 'CHOCA'
 }
+// ---- crear una playlist (carpeta) con el set actual ----
+const savingSet = ref(false)
+const setName = ref('')
+const setBusy = ref(false)
+const setInput = ref<HTMLInputElement>()
+async function askSetName() {
+  const d = new Date()
+  setName.value = `Set ${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+  savingSet.value = true
+  await nextTick()
+  setInput.value?.select()
+}
+async function saveSetAsPlaylist() {
+  const name = setName.value.trim()
+  if (!name || setBusy.value || !setItems.value.length) return
+  setBusy.value = true
+  try {
+    const res = await api.createPlaylistFromSet(name, setItems.value.map((it) => it.track.path))
+    savingSet.value = false
+    await loadLibrary()
+    const skipped = res.skipped?.length ?? 0
+    toast(`Playlist «${res.folder}» creada con ${res.copied} canciones${skipped ? ` (${skipped} no se pudieron copiar)` : ''}`, 7000)
+  } catch (e) {
+    toast(errorText(e))
+  } finally {
+    setBusy.value = false
+  }
+}
+
 function playSet() {
   const its = setItems.value
   if (!its.length) return
@@ -424,9 +454,28 @@ function playSet() {
       </ul>
       <div class="row" style="margin-top: 8px">
         <button class="btn small primary" :disabled="!setItems.length" @click="playSet">▶ Reproducir set</button>
+        <button class="btn small" :disabled="!setItems.length" title="Crea una playlist (carpeta) nueva con copias de las canciones del set, en este orden" @click="askSetName">Crear playlist…</button>
         <button class="btn small" :disabled="!setItems.length" @click="setList = []">Vaciar</button>
       </div>
     </section>
     <TrackDialogs ref="dlg" />
+    <Teleport to="body">
+      <div v-if="savingSet" class="modal" @mousedown.self="!setBusy && (savingSet = false)">
+        <div class="dialog" role="dialog" aria-label="Crear playlist desde el set">
+          <div class="cap">Crear playlist desde el set</div>
+          <div class="dlg-title">{{ setItems.length }} canciones</div>
+          <label class="label" for="setname">Nombre de la playlist</label>
+          <input id="setname" ref="setInput" v-model="setName" type="text" maxlength="100" spellcheck="false" :disabled="setBusy" @keydown.enter="saveSetAsPlaylist" @keydown.esc="!setBusy && (savingSet = false)" />
+          <div class="note">Se crea una carpeta nueva en la biblioteca con <b>copias</b> de estas canciones, numeradas en el orden del set (01, 02…). Las originales no se tocan.</div>
+          <div class="row spread" style="margin-top: 12px">
+            <span class="hint">{{ setBusy ? 'COPIANDO…' : 'ENTER CREAR · ESC CANCELAR' }}</span>
+            <span class="row">
+              <button class="btn small" :disabled="setBusy" @click="savingSet = false">Cancelar</button>
+              <button class="btn small primary" :disabled="!setName.trim() || setBusy" @click="saveSetAsPlaylist">Crear playlist</button>
+            </span>
+          </div>
+        </div>
+      </div>
+    </Teleport>
   </div>
 </template>

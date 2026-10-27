@@ -52,11 +52,38 @@ export interface Cue {
   color: number
 }
 
+export type ConvertFormat = 'mp3' | 'm4a' | 'opus' | 'flac' | 'wav'
+export type ConvertMode = 'keep' | 'playlist' | 'replace'
+export interface ConvertRequest {
+  rels: string[]
+  format: ConvertFormat
+  bitrate: number
+  mode: ConvertMode
+  newName: string
+}
+export interface ConvertResult {
+  converted: number
+  trashed: number
+  folder: string
+  skipped: string[] | null
+  failed: string[] | null
+  bytesBefore: number
+  bytesAfter: number
+  canceled: boolean
+}
+export interface ConvertProgress {
+  done: number
+  total: number
+  current: string
+}
+
 export interface StoredAnalysis {
   size: number
   version: number
   duration: number
   bpm: number
+  bpmConf?: number
+  bpmAlt?: number[]
   beatOffset: number
   keyPc: number
   keyMinor: boolean
@@ -240,4 +267,10 @@ export interface NormalizeResult {
   newSize: number
   oldSize: number
   backup: string
+}
+
+export interface SetResult {
+  folder: string
+  copied: number
+  skipped: string[] | null
 }

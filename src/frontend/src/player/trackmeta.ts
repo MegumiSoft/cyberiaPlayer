@@ -46,6 +46,11 @@ export function renameMeta(from: string, to: string): void {
   }
 }
 
+/** Una copia de la canción en otra playlist hereda los metadatos del original. */
+export function copyMeta(from: string, to: string): void {
+  if (metas[from]) metas[to] = JSON.parse(JSON.stringify(metas[from]))
+}
+
 export interface Grid {
   bpm: number
   period: number

@@ -94,6 +94,72 @@ func MoveTrack(root, rel, destDir string) (string, error) {
 	return path.Clean(filepath.ToSlash(back)), nil
 }
 
+// CopyTrack copia un archivo de audio a otra playlist dejando también el original. destName "" conserva el nombre;
+// si se da, es solo el nombre del archivo (la extensión se conserva). Nunca sobrescribe. Devuelve la nueva ruta relativa.
+func CopyTrack(root, rel, destDir, destName string) (string, error) {
+	src, err := resolveIn(root, rel)
+	if err != nil {
+		return "", err
+	}
+	if ContentType(src) == "" {
+		return "", errOutside
+	}
+	realRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", err
+	}
+	dst := realRoot
+	if destDir != "" {
+		if dst, err = resolveIn(root, destDir); err != nil {
+			return "", err
+		}
+	}
+	if st, err := os.Stat(dst); err != nil || !st.IsDir() {
+		return "", errors.New("la playlist de destino no existe")
+	}
+	name := filepath.Base(src)
+	if destName != "" {
+		clean, err := cleanFolderName(strings.TrimSuffix(destName, filepath.Ext(destName)))
+		if err != nil {
+			return "", err
+		}
+		name = clean + filepath.Ext(src)
+	}
+	newFull := filepath.Join(dst, name)
+	if newFull == src {
+		return "", errors.New("la canción ya está en esa playlist")
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return "", err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(newFull, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		if os.IsExist(err) {
+			return "", errors.New("ya hay un archivo con ese nombre en la playlist de destino")
+		}
+		return "", err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		os.Remove(newFull)
+		return "", err
+	}
+	if err := out.Close(); err != nil {
+		os.Remove(newFull)
+		return "", err
+	}
+	if st, err := os.Stat(src); err == nil {
+		_ = os.Chtimes(newFull, st.ModTime(), st.ModTime())
+	}
+	back, err := filepath.Rel(realRoot, newFull)
+	if err != nil {
+		return "", err
+	}
+	return path.Clean(filepath.ToSlash(back)), nil
+}
+
 // ResolveFile devuelve la ruta real de una canción de la biblioteca (ruta relativa) con las mismas
 // garantías de seguridad que el servidor: dentro de la raíz, sin ocultos y solo audio.
 func ResolveFile(root, rel string) (string, error) {

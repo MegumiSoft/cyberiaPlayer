@@ -2,7 +2,7 @@
 import { reactive } from 'vue'
 import { api } from '../api'
 import type { LibTrack } from '../types'
-import { analyze, ANALYSIS_VERSION, MAX_ANALYZE_BYTES, type Analysis } from './analysis'
+import { analyze, analyzeViaBackend, ANALYSIS_VERSION, needsBackendDecode, type Analysis } from './analysis'
 import { b64ToBytes, bytesToB64 } from './bytes'
 import { metaOf, updateMeta } from './trackmeta'
 
@@ -12,7 +12,7 @@ export const batch = reactive({ running: false, done: 0, total: 0, current: '', 
 export function persistAnalysis(track: LibTrack, a: Analysis): void {
   updateMeta(track.path, (m) => {
     m.analysis = {
-      size: track.size, version: ANALYSIS_VERSION, duration: a.duration, bpm: a.bpm, beatOffset: a.beatOffset,
+      size: track.size, version: ANALYSIS_VERSION, duration: a.duration, bpm: a.bpm, bpmConf: a.bpmConf, bpmAlt: a.bpmAlt, beatOffset: a.beatOffset,
       keyPc: a.key?.pc ?? 0, keyMinor: a.key?.minor ?? false, keyConf: a.key?.conf ?? 0, hasKey: !!a.key,
     }
   })
@@ -24,8 +24,8 @@ export const isAnalyzed = (t: LibTrack): boolean => {
   return !!a && a.version === ANALYSIS_VERSION && a.size === t.size
 }
 
-/** Pendientes: sin análisis vigente y de un tamaño que se puede decodificar. */
-export const pendingTracks = (tracks: LibTrack[]): LibTrack[] => tracks.filter((t) => !isAnalyzed(t) && t.size <= MAX_ANALYZE_BYTES)
+/** Pendientes: las que no tienen un análisis vigente. */
+export const pendingTracks = (tracks: LibTrack[]): LibTrack[] => tracks.filter((t) => !isAnalyzed(t))
 
 const CHUNK = 1 << 20
 async function readWhole(track: LibTrack): Promise<ArrayBuffer> {
@@ -51,7 +51,7 @@ export async function analyzeAll(tracks: LibTrack[]): Promise<void> {
       if (batch.cancel) break
       batch.current = t.title
       try {
-        persistAnalysis(t, await analyze(await readWhole(t)))
+        persistAnalysis(t, needsBackendDecode(t) ? await analyzeViaBackend(t.path) : await analyze(await readWhole(t)))
       } catch {
         batch.failed++
       }

@@ -38,6 +38,12 @@ const keyConf = computed(() => Math.round((player.key?.conf ?? 0) * 100))
 const keyBars = computed(() => Math.round((player.key?.conf ?? 0) * 5))
 const hasWave = computed(() => !!player.analysis || player.analyzing)
 const grid = computed(() => gridOf(cur.value?.track.path))
+/** Si el análisis dudó del tempo y el usuario no tocó la rejilla, se ofrecen los otros tempos plausibles. */
+const altBpms = computed(() => {
+  const a = player.analysis
+  if (!a || !a.bpmAlt?.length || a.bpmConf >= 0.25 || meta.value?.gridSet) return []
+  return a.bpmAlt
+})
 const meta = computed(() => (cur.value ? metaOf(cur.value.track.path) : null))
 const normDlg = ref<InstanceType<typeof NormalizeDialog>>()
 const hot = computed(() => Array.from({ length: 8 }, (_, i) => meta.value?.cues.find((c) => c.slot === i) ?? null))
@@ -215,6 +221,10 @@ function onVol(e: Event) {
               />
               <button class="tog m" :disabled="!grid" title="Mitad de tempo" @click="scaleGridBpm(0.5)">÷2</button>
               <button class="tog m" :disabled="!grid" title="Doble de tempo" @click="scaleGridBpm(2)">×2</button>
+              <span v-if="altBpms.length" class="altbpm" title="El análisis dudó del tempo: prueba otro">
+                <span class="hint">¿OTRO?</span>
+                <button v-for="b in altBpms" :key="b" class="tog m" @click="setGridBpm(b)">{{ b }}</button>
+              </span>
               <span class="nudge" :class="{ off: !grid }" title="Mover toda la rejilla (milisegundos)">
                 <button class="tog m" :disabled="!grid" @click="nudgeGrid(-0.01)">−10</button>
                 <button class="tog m" :disabled="!grid" @click="nudgeGrid(-0.001)">−1</button>

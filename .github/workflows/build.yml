@@ -69,7 +69,11 @@ jobs:
         run: go install github.com/wailsapp/wails/v2/cmd/wails@${{ env.WAILS_VERSION }}
       - name: Resolver dependencias de Go
         run: go mod tidy
-      - name: Compilar
+      - name: Compilar (macOS: universal, firmado ad-hoc y empaquetado con ditto)
+        if: matrix.name == 'macos'
+        run: ./scripts/build.sh --universal --zip
+      - name: Compilar (Windows)
+        if: matrix.name == 'windows'
         run: wails build -platform ${{ matrix.platform }} -clean
 
       - name: Empaquetar (Windows)
@@ -78,7 +82,7 @@ jobs:
         run: Compress-Archive -Path build/bin/*.exe -DestinationPath ${{ matrix.artifact }}.zip
       - name: Empaquetar (macOS)
         if: matrix.name == 'macos'
-        run: ditto -c -k --keepParent build/bin/*.app ${{ matrix.artifact }}.zip
+        run: cp dist/Cyberia-macos.zip ${{ matrix.artifact }}.zip
 
       - uses: actions/upload-artifact@v4
         with:

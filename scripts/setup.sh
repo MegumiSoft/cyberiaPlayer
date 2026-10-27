@@ -85,6 +85,8 @@ if have go; then
 fi
 if have npm; then
   say "Instalando dependencias de la interfaz (src/frontend)"
+  # Sin lockfile ni node_modules viejos: evita el error de npm con los módulos nativos de cada sistema (rollup/esbuild).
+  rm -rf src/frontend/node_modules src/frontend/package-lock.json
   npm install --prefix src/frontend --no-audit --no-fund
 fi
 

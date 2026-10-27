@@ -6,8 +6,11 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -142,6 +145,7 @@ func (a *App) startup(ctx context.Context) {
 
 func (a *App) shutdown(ctx context.Context) {
 	a.cancel()
+	_ = os.RemoveAll(a.pcmDir())
 	a.q.Wait(5 * time.Second)
 	if a.libSrv != nil {
 		_ = a.libSrv.Close()
@@ -351,6 +355,62 @@ func (a *App) MoveTrack(rel, destDir string) (string, error) {
 		_ = a.meta.Rename(rel, filepath.ToSlash(nuevo)) // los cues y la rejilla viajan con la canción
 	}
 	return nuevo, err
+}
+
+// CopyTrack copia una canción a otra playlist y la deja también en la original (con sus cues y rejilla).
+func (a *App) CopyTrack(rel, destDir string) (string, error) {
+	nuevo, err := library.CopyTrack(a.settings.Get().OutDir, rel, destDir, "")
+	if err == nil {
+		_ = a.meta.Copy(rel, filepath.ToSlash(nuevo))
+	}
+	return nuevo, err
+}
+
+// SetResult es lo que pasó al crear una playlist a partir de un set.
+type SetResult struct {
+	Folder  string   `json:"folder"`
+	Copied  int      `json:"copied"`
+	Skipped []string `json:"skipped"`
+}
+
+var leadingNumber = regexp.MustCompile(`^\s*\d+\s*[-.)_]?\s*`)
+
+// CreatePlaylistFromSet crea una playlist nueva (carpeta) con COPIAS de las canciones del set, en el orden del set:
+// los archivos se numeran «01 - », «02 - »… para que la lista respete ese orden. Los originales no se tocan.
+func (a *App) CreatePlaylistFromSet(name string, rels []string) (SetResult, error) {
+	var res SetResult
+	if len(rels) == 0 {
+		return res, errors.New("el set está vacío")
+	}
+	root := a.settings.Get().OutDir
+	folder, err := library.CreateFolder(root, name)
+	if err != nil {
+		return res, err
+	}
+	res.Folder = folder
+	width := len(strconv.Itoa(len(rels)))
+	if width < 2 {
+		width = 2
+	}
+	for i, rel := range rels {
+		base := strings.TrimSuffix(path.Base(rel), path.Ext(rel))
+		if stripped := strings.TrimSpace(leadingNumber.ReplaceAllString(base, "")); stripped != "" {
+			base = stripped
+		}
+		newName := fmt.Sprintf("%0*d - %s", width, i+1, base) + path.Ext(rel)
+		nuevo, err := library.CopyTrack(root, rel, folder, newName)
+		if err != nil {
+			res.Skipped = append(res.Skipped, path.Base(rel)+": "+err.Error())
+			continue
+		}
+		_ = a.meta.Copy(rel, filepath.ToSlash(nuevo))
+		res.Copied++
+	}
+	if res.Copied == 0 {
+		_ = os.Remove(filepath.Join(root, folder)) // carpeta vacía: no dejarla
+		return res, errors.New("no se pudo copiar ninguna canción")
+	}
+	return res, nil
 }
 
 // ReadTrackChunk entrega un trozo (hasta 4 MB) de una canción: así el reproductor puede mostrar el progreso

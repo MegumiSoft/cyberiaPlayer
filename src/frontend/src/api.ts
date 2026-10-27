@@ -1,4 +1,4 @@
-import type { Job, LibraryResult, NewJob, PreviewResult, Settings, ToolStatus, TrackMeta, Loudness, NormalizeResult, USBInfo, USBPreview, USBRequest, USBStatus, USBVolume } from './types'
+import type { ConvertProgress, ConvertRequest, ConvertResult, Job, LibraryResult, NewJob, PreviewResult, Settings, ToolStatus, TrackMeta, Loudness, NormalizeResult, SetResult, USBInfo, USBPreview, USBRequest, USBStatus, USBVolume } from './types'
 import { ACTIVE } from './types'
 
 // Puente hacia el backend en Go. Dentro de Wails, `window.go.<paquete>.App.*` y `window.runtime`
@@ -38,6 +38,11 @@ export interface Api {
   spotifyLogin(): Promise<string>
   spotifyLogout(): Promise<void>
   toggleFullscreen(): Promise<boolean>
+  copyTrack(path: string, destDir: string): Promise<string>
+  createPlaylistFromSet(name: string, paths: string[]): Promise<SetResult>
+  prepareAnalysis(path: string): Promise<number>
+  readAnalysisChunk(path: string, offset: number, length: number): Promise<string>
+  releaseAnalysis(path: string): Promise<void>
   measureLoudness(path: string): Promise<Loudness>
   normalizeTrack(path: string, refPath: string): Promise<NormalizeResult>
   usbVolumes(): Promise<USBVolume[]>
@@ -46,6 +51,9 @@ export interface Api {
   usbState(): Promise<USBStatus>
   startUsbExport(req: USBRequest): Promise<void>
   cancelUsbExport(): Promise<void>
+  convertTracks(req: ConvertRequest): Promise<ConvertResult>
+  cancelConvert(): Promise<void>
+  onConvert(cb: (p: ConvertProgress) => void): () => void
   onUsb(cb: (s: USBStatus) => void): () => void
   onQueue(cb: (jobs: Job[]) => void): () => void
   onStatus(cb: (s: ToolStatus) => void): () => void
@@ -106,6 +114,11 @@ const real: Api = {
   spotifyLogin: () => call('SpotifyLogin'),
   spotifyLogout: () => call('SpotifyLogout'),
   toggleFullscreen: () => call('ToggleFullscreen'),
+  copyTrack: (path, destDir) => call('CopyTrack', path, destDir),
+  createPlaylistFromSet: (name, paths) => call('CreatePlaylistFromSet', name, paths),
+  prepareAnalysis: (path) => call('PrepareAnalysis', path),
+  readAnalysisChunk: (path, offset, length) => call('ReadAnalysisChunk', path, offset, length),
+  releaseAnalysis: (path) => call('ReleaseAnalysis', path),
   measureLoudness: (path) => call('MeasureLoudness', path),
   normalizeTrack: (path, ref) => call('NormalizeTrack', path, ref),
   usbVolumes: () => call('USBVolumes'),
@@ -114,6 +127,9 @@ const real: Api = {
   usbState: () => call('USBState'),
   startUsbExport: (req) => call('StartUSBExport', req),
   cancelUsbExport: () => call('CancelUSBExport'),
+  convertTracks: (req) => call('ConvertTracks', req),
+  cancelConvert: () => call('CancelConvert'),
+  onConvert: (cb) => window.runtime!.EventsOn('convert', (d) => cb(d as ConvertProgress)),
   onUsb: (cb) => window.runtime!.EventsOn('usb', (d) => cb(d as USBStatus)),
   onQueue: (cb) => window.runtime!.EventsOn('queue', (d) => cb(d as Job[])),
   onStatus: (cb) => window.runtime!.EventsOn('status', (d) => cb(d as ToolStatus)),
@@ -150,6 +166,7 @@ function mockLibrary(): LibraryResult {
 
 const mockMeta: Record<string, TrackMeta> = {}
 const mockWaves: Record<string, string> = {}
+const mockPcm: Record<string, Uint8Array> = {}
 
 function createMock(): Api {
   let settings: Settings = {
@@ -182,6 +199,8 @@ function createMock(): Api {
   const queueSubs = new Set<(j: Job[]) => void>()
   const statusSubs = new Set<(s: ToolStatus) => void>()
   const usbSubs = new Set<(s: USBStatus) => void>()
+  const convSubs = new Set<(p: ConvertProgress) => void>()
+  let convCancel = false
   const emit = () => queueSubs.forEach((cb) => cb(jobs.map((j) => ({ ...j }))))
   let seq = 0
 
@@ -237,6 +256,28 @@ function createMock(): Api {
     trashTrack: async () => undefined,
     createPlaylist: async (name) => name,
     moveTrack: async (path, destDir) => `${destDir}/${path.split('/').pop()}`,
+    copyTrack: async (path, destDir) => `${destDir}/${path.split('/').pop()}`,
+    createPlaylistFromSet: async (name, paths) => ({ folder: name, copied: paths.length, skipped: null }),
+    // Simulador: decodifica en el navegador para poder probar el flujo de WAV/FLAC sin backend.
+    prepareAnalysis: async (path) => {
+      const lib = mockLibrary()
+      const url = `${lib.baseUrl}/f/${path.split('/').map(encodeURIComponent).join('/')}`
+      const data = await (await fetch(url)).arrayBuffer()
+      const ac = new OfflineAudioContext(1, 1, 22050)
+      const buf = await ac.decodeAudioData(data)
+      const ch = buf.getChannelData(0)
+      const pcm = new Int16Array(ch.length)
+      for (let i = 0; i < ch.length; i++) pcm[i] = Math.max(-1, Math.min(1, ch[i])) * 32767
+      mockPcm[path] = new Uint8Array(pcm.buffer)
+      return pcm.byteLength
+    },
+    readAnalysisChunk: async (path, offset, length) => {
+      const b = mockPcm[path].subarray(offset, offset + length)
+      let bin = ''
+      for (let i = 0; i < b.length; i += 0x8000) bin += String.fromCharCode(...b.subarray(i, i + 0x8000))
+      return btoa(bin)
+    },
+    releaseAnalysis: async (path) => void delete mockPcm[path],
     previewUrls: async (urls) => {
       await new Promise((r) => setTimeout(r, 500))
       return urls.map((url) => {
@@ -366,6 +407,30 @@ function createMock(): Api {
       }
     },
     cancelUsbExport: async () => undefined,
+    convertTracks: async (req) => {
+      convCancel = false
+      const res: ConvertResult = { converted: 0, trashed: 0, folder: req.mode === 'playlist' ? req.newName : '', skipped: [], failed: [], bytesBefore: 0, bytesAfter: 0, canceled: false }
+      for (let i = 0; i < req.rels.length; i++) {
+        if (convCancel) {
+          res.canceled = true
+          break
+        }
+        const name = req.rels[i].split('/').pop() ?? ''
+        convSubs.forEach((cb) => cb({ done: i, total: req.rels.length, current: name }))
+        await new Promise((r) => setTimeout(r, 250))
+        if (name.toLowerCase().endsWith('.' + req.format)) res.skipped!.push(`${name}: ya está en ${req.format.toUpperCase()}`)
+        else {
+          res.converted++
+          res.bytesBefore += 30_000_000
+          res.bytesAfter += req.format === 'wav' || req.format === 'flac' ? 28_000_000 : 8_000_000
+          if (req.mode === 'replace') res.trashed++
+        }
+      }
+      convSubs.forEach((cb) => cb({ done: req.rels.length, total: req.rels.length, current: '' }))
+      return res
+    },
+    cancelConvert: async () => void (convCancel = true),
+    onConvert: (cb) => (convSubs.add(cb), () => void convSubs.delete(cb)),
     onUsb: (cb) => (usbSubs.add(cb), () => void usbSubs.delete(cb)),
     onQueue: (cb) => (queueSubs.add(cb), () => void queueSubs.delete(cb)),
     onStatus: (cb) => (statusSubs.add(cb), () => void statusSubs.delete(cb)),

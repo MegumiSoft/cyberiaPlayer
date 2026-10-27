@@ -1212,3 +1212,11 @@ input[type='checkbox'] {
 .urlrow .mascot { flex: 0 0 30%; width: 30%; max-width: 440px; min-width: 150px; object-fit: contain; object-position: right center; align-self: center; user-select: none; pointer-events: none; }
 @media (max-width: 1000px) { .urlrow .mascot { flex-basis: 24%; width: 24%; } }
 .urlrow .mascot { border: 0; background: none; padding: 0; }
+.copyopt { display: flex; align-items: center; gap: 8px; margin: 8px 0 4px; }
+.altbpm { display: inline-flex; align-items: center; gap: 4px; margin: 0 4px; }
+.convdlg { width: min(560px, 94vw); }
+.convopt { display: flex; align-items: flex-start; gap: 8px; padding: 8px 10px; margin-top: 6px; border: 1px solid var(--line-2); border-radius: 4px; cursor: pointer; font-size: 13px; line-height: 1.35; }
+.convopt.on { border-color: var(--cyan); background: rgba(56, 225, 255, 0.06); }
+.convopt input { margin-top: 3px; }
+.convname { width: 100%; margin-top: 6px; }
+.convlist { margin: 4px 0 0; padding-left: 16px; font-size: 12px; opacity: 0.85; word-break: break-all; }

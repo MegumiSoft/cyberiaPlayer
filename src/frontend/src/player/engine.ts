@@ -1,7 +1,7 @@
 import { markRaw, reactive } from 'vue'
 import { api, inWails } from '../api'
 import type { LibPlaylist, LibTrack } from '../types'
-import { analyze, ANALYSIS_VERSION, MAX_ANALYZE_BYTES, type Analysis, type KeyResult } from './analysis'
+import { analyze, analyzeViaBackend, ANALYSIS_VERSION, needsBackendDecode, type Analysis, type KeyResult } from './analysis'
 import { b64ToBytes } from './bytes'
 import { persistAnalysis } from './libanalysis'
 import { gridOf, metaOf } from './trackmeta'
@@ -207,6 +207,8 @@ async function analysisFromDisk(it: QueueItem): Promise<Analysis | null> {
       frames: Math.floor(wave.length / 3),
       duration: st.duration,
       bpm: st.bpm,
+      bpmConf: st.bpmConf ?? 1,
+      bpmAlt: st.bpmAlt ?? [],
       beatOffset: st.beatOffset,
       beatPeriod: st.bpm > 0 ? 60 / st.bpm : 0,
       key: st.hasKey ? { pc: st.keyPc, minor: st.keyMinor, conf: st.keyConf } : null,
@@ -219,13 +221,19 @@ async function analysisFromDisk(it: QueueItem): Promise<Analysis | null> {
 async function startAnalysis(it: QueueItem, token: number): Promise<void> {
   const cached = analysisCache.get(it.track.path)
   if (cached) return applyAnalysis(cached, token)
-  if (it.track.size > MAX_ANALYZE_BYTES) return // demasiado grande: se queda el deslizador sencillo
   player.analyzing = true
   try {
-    const buf = await bytesForAnalysis(it)
+    let a: Analysis
+    if (needsBackendDecode(it.track)) {
+      mark('análisis: decodificando en el backend')
+      a = await analyzeViaBackend(it.track.path)
+    } else {
+      const buf = await bytesForAnalysis(it)
+      if (token !== playToken) return
+      mark('análisis: decodificando')
+      a = await analyze(buf)
+    }
     if (token !== playToken) return
-    mark('análisis: decodificando')
-    const a = await analyze(buf)
     mark('análisis listo')
     analysisCache.set(it.track.path, a)
     while (analysisCache.size > 30) analysisCache.delete(analysisCache.keys().next().value as string)
