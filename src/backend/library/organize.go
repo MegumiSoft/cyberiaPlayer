@@ -54,28 +54,43 @@ func CreateFolder(root, name string) (string, error) {
 	return clean, nil
 }
 
-// MoveTrack mueve un archivo de audio a otra playlist (carpeta). destDir "" significa la raíz de la
-// biblioteca. Nunca sobrescribe y no sale de la raíz. Devuelve la nueva ruta relativa.
-func MoveTrack(root, rel, destDir string) (string, error) {
-	src, err := resolveIn(root, rel)
-	if err != nil {
-		return "", err
+// trackPaths resuelve lo común de mover y copiar: la canción de origen (ResolveFile: dentro de la raíz, solo audio y
+// archivo regular, nunca una carpeta ni una tubería con nombre de .mp3) y la carpeta de destino, que debe existir.
+// destDir "" es la raíz de la biblioteca.
+func trackPaths(root, rel, destDir string) (realRoot, src, dst string, err error) {
+	if src, err = ResolveFile(root, rel); err != nil {
+		return "", "", "", err
 	}
-	if ContentType(src) == "" {
-		return "", errOutside
+	if realRoot, err = filepath.EvalSymlinks(root); err != nil {
+		return "", "", "", err
 	}
-	realRoot, err := filepath.EvalSymlinks(root)
-	if err != nil {
-		return "", err
-	}
-	dst := realRoot
+	dst = realRoot
 	if destDir != "" {
 		if dst, err = resolveIn(root, destDir); err != nil {
-			return "", err
+			return "", "", "", err
 		}
 	}
 	if st, err := os.Stat(dst); err != nil || !st.IsDir() {
-		return "", errors.New("la playlist de destino no existe")
+		return "", "", "", errors.New("la playlist de destino no existe")
+	}
+	return realRoot, src, dst, nil
+}
+
+// relFromRoot devuelve la ruta relativa (con «/») de full dentro de la raíz.
+func relFromRoot(realRoot, full string) (string, error) {
+	back, err := filepath.Rel(realRoot, full)
+	if err != nil {
+		return "", err
+	}
+	return path.Clean(filepath.ToSlash(back)), nil
+}
+
+// MoveTrack mueve un archivo de audio a otra playlist (carpeta). destDir "" significa la raíz de la
+// biblioteca. Nunca sobrescribe y no sale de la raíz. Devuelve la nueva ruta relativa.
+func MoveTrack(root, rel, destDir string) (string, error) {
+	realRoot, src, dst, err := trackPaths(root, rel, destDir)
+	if err != nil {
+		return "", err
 	}
 	newFull := filepath.Join(dst, filepath.Base(src))
 	if newFull == src {
@@ -87,35 +102,15 @@ func MoveTrack(root, rel, destDir string) (string, error) {
 	if err := os.Rename(src, newFull); err != nil {
 		return "", err
 	}
-	back, err := filepath.Rel(realRoot, newFull)
-	if err != nil {
-		return "", err
-	}
-	return path.Clean(filepath.ToSlash(back)), nil
+	return relFromRoot(realRoot, newFull)
 }
 
 // CopyTrack copia un archivo de audio a otra playlist dejando también el original. destName "" conserva el nombre;
 // si se da, es solo el nombre del archivo (la extensión se conserva). Nunca sobrescribe. Devuelve la nueva ruta relativa.
 func CopyTrack(root, rel, destDir, destName string) (string, error) {
-	src, err := resolveIn(root, rel)
+	realRoot, src, dst, err := trackPaths(root, rel, destDir)
 	if err != nil {
 		return "", err
-	}
-	if ContentType(src) == "" {
-		return "", errOutside
-	}
-	realRoot, err := filepath.EvalSymlinks(root)
-	if err != nil {
-		return "", err
-	}
-	dst := realRoot
-	if destDir != "" {
-		if dst, err = resolveIn(root, destDir); err != nil {
-			return "", err
-		}
-	}
-	if st, err := os.Stat(dst); err != nil || !st.IsDir() {
-		return "", errors.New("la playlist de destino no existe")
 	}
 	name := filepath.Base(src)
 	if destName != "" {
@@ -153,11 +148,7 @@ func CopyTrack(root, rel, destDir, destName string) (string, error) {
 	if st, err := os.Stat(src); err == nil {
 		_ = os.Chtimes(newFull, st.ModTime(), st.ModTime())
 	}
-	back, err := filepath.Rel(realRoot, newFull)
-	if err != nil {
-		return "", err
-	}
-	return path.Clean(filepath.ToSlash(back)), nil
+	return relFromRoot(realRoot, newFull)
 }
 
 // ResolveFile devuelve la ruta real de una canción de la biblioteca (ruta relativa) con las mismas

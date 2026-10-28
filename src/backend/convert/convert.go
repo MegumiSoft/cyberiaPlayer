@@ -1,5 +1,6 @@
 // Package convert pasa una canción de un formato de audio a otro con ffmpeg (por ejemplo WAV → MP3),
-// conservando etiquetas y carátula. Nunca toca el archivo original ni sobrescribe el destino.
+// conservando etiquetas y carátula. Nunca toca el archivo original ni sobrescribe el destino (salvo una ventana mínima
+// en sistemas de archivos sin enlaces duros, ver publish).
 package convert
 
 import (
@@ -7,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,36 +24,113 @@ type Runner struct {
 	Configure func(*exec.Cmd)
 }
 
-// Format describe un formato de salida.
+// Format describe un formato de salida. La interfaz lo recibe tal cual (ConvertFormats) para armar el diálogo, así la
+// lista vive solo aquí.
 type Format struct {
-	Ext        string // con punto: ".mp3"
-	Lossy      bool
-	DefaultK   int   // kbps por defecto (0 en los formatos sin pérdida)
-	Bitrates   []int // kbps ofrecidos
-	KeepsCover bool
+	ID         string `json:"id"`
+	Label      string `json:"label"`
+	Ext        string `json:"-"` // con punto: ".mp3"
+	Lossy      bool   `json:"lossy"`
+	Default    int    `json:"default"`  // kbps por defecto (0 en los formatos sin pérdida)
+	Bitrates   []int  `json:"bitrates"` // kbps de tasa fija ofrecidos
+	VBR        []int  `json:"vbr"`      // calidades VBR ofrecidas (LAME: 0 = la mejor); solo MP3
+	KeepsCover bool   `json:"-"`
 }
 
-var formats = map[string]Format{
-	"mp3":  {".mp3", true, 320, []int{320, 256, 192, 128}, true},
-	"m4a":  {".m4a", true, 256, []int{320, 256, 192, 128}, true},
-	"opus": {".opus", true, 160, []int{256, 192, 160, 128, 96}, false},
-	"flac": {".flac", false, 0, nil, true},
-	"wav":  {".wav", false, 0, nil, false},
+var formats = []Format{
+	{ID: "mp3", Label: "MP3", Ext: ".mp3", Lossy: true, Default: 320, Bitrates: []int{320, 256, 192, 128}, VBR: []int{0, 2}, KeepsCover: true},
+	{ID: "m4a", Label: "M4A (AAC)", Ext: ".m4a", Lossy: true, Default: 256, Bitrates: []int{320, 256, 192, 128}, KeepsCover: true},
+	{ID: "opus", Label: "OPUS", Ext: ".opus", Lossy: true, Default: 160, Bitrates: []int{256, 192, 160, 128, 96}},
+	{ID: "aac", Label: "AAC (.aac, sin etiquetas)", Ext: ".aac", Lossy: true, Default: 256, Bitrates: []int{320, 256, 192, 128}},
+	{ID: "flac", Label: "FLAC", Ext: ".flac", KeepsCover: true},
+	{ID: "wav", Label: "WAV", Ext: ".wav"},
 }
+
+// lossyExts son las extensiones con pérdida que la biblioteca reconoce (como origen), sin punto.
+var lossyExts = []string{"mp3", "m4a", "aac", "opus", "ogg", "oga"}
+
+// Formats devuelve los formatos de salida, en el orden en que se ofrecen.
+func Formats() []Format { return append([]Format(nil), formats...) }
+
+// LossyExts devuelve las extensiones con pérdida (sin punto).
+func LossyExts() []string { return append([]string(nil), lossyExts...) }
 
 // Lookup devuelve el formato de salida (acepta «mp3», «.MP3»…).
 func Lookup(name string) (Format, bool) {
-	f, ok := formats[strings.TrimPrefix(strings.ToLower(strings.TrimSpace(name)), ".")]
-	return f, ok
+	id := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(name)), ".")
+	for _, f := range formats {
+		if f.ID == id {
+			return f, true
+		}
+	}
+	return Format{}, false
 }
 
 // IsLossy dice si la extensión (con o sin punto) es un formato con pérdida.
 func IsLossy(ext string) bool {
-	switch strings.TrimPrefix(strings.ToLower(ext), ".") {
-	case "mp3", "m4a", "aac", "ogg", "opus", "wma":
-		return true
+	e := strings.TrimPrefix(strings.ToLower(ext), ".")
+	for _, l := range lossyExts {
+		if l == e {
+			return true
+		}
 	}
 	return false
+}
+
+// Options es la calidad pedida. Los dos son opcionales (nil = lo predeterminado del formato) y no se combinan; se
+// ignoran en los formatos sin pérdida.
+type Options struct {
+	Bitrate *int // kbps de tasa fija
+	VBR     *int // calidad VBR (solo MP3)
+}
+
+func contains(list []int, v int) bool {
+	for _, x := range list {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}
+
+// Validate comprueba que la calidad pedida exista en ese formato, con un mensaje claro (mejor que un fallo de ffmpeg).
+func Validate(format string, o Options) error {
+	f, ok := Lookup(format)
+	if !ok {
+		return fmt.Errorf("formato desconocido: %s", format)
+	}
+	if !f.Lossy {
+		return nil
+	}
+	if o.Bitrate != nil && o.VBR != nil {
+		return errors.New("elige una tasa fija (kbps) o VBR, no las dos")
+	}
+	if o.VBR != nil && !contains(f.VBR, *o.VBR) {
+		if len(f.VBR) == 0 {
+			return fmt.Errorf("%s no ofrece VBR", f.Label)
+		}
+		return fmt.Errorf("calidad VBR no admitida: V%d (opciones en %s: %s)", *o.VBR, f.Label, joinV(f.VBR))
+	}
+	if o.Bitrate != nil && !contains(f.Bitrates, *o.Bitrate) {
+		return fmt.Errorf("bitrate no admitido: %d kbps (opciones en %s: %s)", *o.Bitrate, f.Label, joinK(f.Bitrates))
+	}
+	return nil
+}
+
+func joinK(v []int) string {
+	s := make([]string, len(v))
+	for i, x := range v {
+		s[i] = strconv.Itoa(x)
+	}
+	return strings.Join(s, ", ") + " kbps"
+}
+
+func joinV(v []int) string {
+	s := make([]string, len(v))
+	for i, x := range v {
+		s[i] = "V" + strconv.Itoa(x)
+	}
+	return strings.Join(s, ", ")
 }
 
 var (
@@ -88,24 +167,30 @@ func (r Runner) sourceBits(ctx context.Context, in string) int {
 	return 16
 }
 
-func codecArgs(f Format, kbps, bits int) []string {
-	if kbps <= 0 {
-		kbps = f.DefaultK
+func codecArgs(f Format, o Options, bits int) []string {
+	kbps := f.Default
+	if o.Bitrate != nil {
+		kbps = *o.Bitrate
 	}
 	br := strconv.Itoa(kbps) + "k"
-	switch f.Ext {
-	case ".mp3":
+	switch f.ID {
+	case "mp3":
+		if o.VBR != nil {
+			return []string{"-c:a", "libmp3lame", "-q:a", strconv.Itoa(*o.VBR), "-id3v2_version", "3"}
+		}
 		return []string{"-c:a", "libmp3lame", "-b:a", br, "-id3v2_version", "3"}
-	case ".m4a":
+	case "m4a":
 		return []string{"-c:a", "aac", "-b:a", br, "-movflags", "+faststart"}
-	case ".opus":
+	case "aac":
+		return []string{"-c:a", "aac", "-b:a", br}
+	case "opus":
 		return []string{"-c:a", "libopus", "-b:a", br}
-	case ".flac":
+	case "flac":
 		if bits > 16 {
 			return []string{"-c:a", "flac", "-compression_level", "5", "-sample_fmt", "s32", "-bits_per_raw_sample", "24"}
 		}
 		return []string{"-c:a", "flac", "-compression_level", "5", "-sample_fmt", "s16"}
-	default: // .wav
+	default: // wav
 		switch {
 		case bits >= 32:
 			return []string{"-c:a", "pcm_s32le"}
@@ -116,19 +201,38 @@ func codecArgs(f Format, kbps, bits int) []string {
 	}
 }
 
-// Convert escribe en out (que no debe existir) el audio de in en el formato dado. kbps 0 = el predeterminado del
-// formato; se ignora en los formatos sin pérdida. Se escribe primero a un temporal y solo al final se renombra,
-// así un fallo o una cancelación nunca deja un archivo a medias.
-func (r Runner) Convert(ctx context.Context, in, out, format string, kbps int) error {
-	f, ok := Lookup(format)
-	if !ok {
-		return fmt.Errorf("formato desconocido: %s", format)
+var errExists = errors.New("ya existe un archivo con ese nombre")
+
+// publish deja tmp como out sin sobrescribir nada: un enlace duro falla con «ya existe» si out apareció entretanto
+// (os.Rename, en cambio, reemplaza en silencio). En sistemas de archivos sin enlaces duros (FAT/exFAT de un USB) se
+// cae a Rename tras comprobar antes: ahí queda una ventana mínima.
+func publish(tmp, out string) error {
+	err := os.Link(tmp, out)
+	if err == nil {
+		return os.Remove(tmp)
 	}
+	if errors.Is(err, fs.ErrExist) {
+		return errExists
+	}
+	if _, err := os.Lstat(out); err == nil {
+		return errExists
+	}
+	return os.Rename(tmp, out)
+}
+
+// Convert escribe en out (que no debe existir) el audio de in en el formato dado, con la calidad de o (campos nil =
+// lo predeterminado). Se escribe primero a un temporal y solo al final se publica, así un fallo o una cancelación nunca
+// deja un archivo a medias, y nunca se sobrescribe un archivo existente (ver publish para la excepción en FAT).
+func (r Runner) Convert(ctx context.Context, in, out, format string, o Options) error {
+	if err := Validate(format, o); err != nil {
+		return err
+	}
+	f, _ := Lookup(format)
 	if !strings.EqualFold(filepath.Ext(out), f.Ext) {
 		return fmt.Errorf("el destino debe terminar en %s", f.Ext)
 	}
 	if _, err := os.Lstat(out); err == nil {
-		return errors.New("ya existe un archivo con ese nombre")
+		return errExists
 	}
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Minute)
 	defer cancel()
@@ -145,7 +249,7 @@ func (r Runner) Convert(ctx context.Context, in, out, format string, kbps int) e
 			args = append(args, "-vn")
 		}
 		args = append(args, "-map_metadata", "0")
-		args = append(args, codecArgs(f, kbps, bits)...)
+		args = append(args, codecArgs(f, o, bits)...)
 		args = append(args, tmp)
 		var stderr bytes.Buffer
 		c := r.cmd(ctx, args...)
@@ -169,10 +273,7 @@ func (r Runner) Convert(ctx context.Context, in, out, format string, kbps int) e
 	if err != nil || st.Size() < 1024 {
 		return errors.New("ffmpeg no generó un archivo válido")
 	}
-	if _, err := os.Lstat(out); err == nil {
-		return errors.New("ya existe un archivo con ese nombre")
-	}
-	return os.Rename(tmp, out)
+	return publish(tmp, out)
 }
 
 func lastLines(s string, n int) string {

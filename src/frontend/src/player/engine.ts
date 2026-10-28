@@ -226,7 +226,7 @@ async function startAnalysis(it: QueueItem, token: number): Promise<void> {
     let a: Analysis
     if (needsBackendDecode(it.track)) {
       mark('análisis: decodificando en el backend')
-      a = await analyzeViaBackend(it.track.path)
+      a = await analyzeViaBackend(it.track.path, () => token !== playToken)
     } else {
       const buf = await bytesForAnalysis(it)
       if (token !== playToken) return
@@ -240,7 +240,7 @@ async function startAnalysis(it: QueueItem, token: number): Promise<void> {
     persistAnalysis(it.track, a)
     applyAnalysis(a, token)
   } catch {
-    // sin forma de onda: la interfaz usa el deslizador normal
+    // sin forma de onda (o análisis descartado al saltar a otra canción): la interfaz usa el deslizador normal
   } finally {
     if (token === playToken) player.analyzing = false
   }
