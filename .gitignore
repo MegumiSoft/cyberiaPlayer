@@ -4,6 +4,8 @@ src/frontend/dist/*
 !src/frontend/dist/.gitkeep
 src/frontend/node_modules/
 src/frontend/package-lock.json.bak
+# Zips que genera scripts/build.sh --zip
+/dist/
 
 # Wails genera esto en cada build/dev
 src/frontend/wailsjs/

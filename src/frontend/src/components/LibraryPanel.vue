@@ -5,6 +5,7 @@ import { errorText, formatDuration } from '../format'
 import { analyzeAll, batch, isAnalyzed, pendingTracks } from '../player/libanalysis'
 import { current, libraryToQueue, player, playIndex, prefetch, setQueue } from '../player/engine'
 import { playlistName, moveTrackTo } from '../player/trackops'
+import ConvertDialog from './ConvertDialog.vue'
 import TrackDialogs from './TrackDialogs.vue'
 import { guarded, loadLibrary, selectedPlaylist, state, toast, trackUrl } from '../store'
 import type { LibPlaylist } from '../types'
@@ -93,12 +94,12 @@ async function create() {
   }
 }
 
-const pending = computed(() => (pl.value ? pendingTracks(pl.value.tracks).length : 0))
+const pending = computed(() => (pl.value ? pendingTracks(pl.value.tracks, state.durations).length : 0))
 const unanalyzed = computed(() => (pl.value ? pl.value.tracks.filter((t) => !isAnalyzed(t)).length : 0))
 async function analyzeList() {
   const p = pl.value
   if (!p || batch.running) return
-  await analyzeAll(p.tracks)
+  await analyzeAll(p.tracks, state.durations)
   if (!batch.cancel) toast(`Análisis terminado${batch.failed ? ` (${batch.failed} no se pudieron analizar)` : ''}`)
 }
 
@@ -117,6 +118,7 @@ watch(
 )
 
 const dlg = ref<InstanceType<typeof TrackDialogs>>()
+const convDlg = ref<InstanceType<typeof ConvertDialog>>()
 const openPicker = (t: { path: string; title: string }) => dlg.value?.openPicker({ ...t, from: nameOf(pl.value ?? undefined) })
 const askTrash = (t: { path: string; title: string }) => dlg.value?.askTrash({ ...t, from: nameOf(pl.value ?? undefined) })
 
@@ -205,6 +207,7 @@ function onDrop(e: DragEvent, dest: LibPlaylist) {
         {{ pending ? `ANALIZAR TODAS (${pending})` : 'TODAS ANALIZADAS' }}
       </button>
       <button v-else class="btn small danger" @click="batch.cancel = true">DETENER ({{ batch.done }}/{{ batch.total }})</button>
+      <button v-if="!batch.running" class="btn small" :disabled="!pl || !pl.tracks.length" title="Convertir toda esta playlist a otro formato (p. ej. WAV → MP3)" @click="pl && convDlg?.open(pl)">CONVERTIR…</button>
       <span class="hint legend"><i class="lg y" />SIN ANALIZAR <i class="lg g" />ANALIZADA <i class="lg w" />SONANDO</span>
       <div v-if="batch.running" class="loadbar"><i :style="{ width: (batch.total ? (batch.done / batch.total) * 100 : 0) + '%' }" /></div>
       <div v-if="batch.running" class="hint">ANALIZANDO: {{ batch.current }}</div>
@@ -218,5 +221,6 @@ function onDrop(e: DragEvent, dest: LibPlaylist) {
     </div>
 
     <TrackDialogs ref="dlg" />
+    <ConvertDialog ref="convDlg" />
   </div>
 </template>

@@ -16,6 +16,10 @@ export interface Analysis {
   frames: number
   duration: number
   bpm: number // 0 si no se pudo estimar
+  /** 0..1: seguridad del BPM frente al mejor candidato alternativo (bajo = revisar). */
+  bpmConf: number
+  /** Otros tempos plausibles (p. ej. el doble o la mitad). */
+  bpmAlt: number[]
   /** Segundos hasta el primer pulso de la rejilla y duración de un pulso. 0 si no hay BPM. */
   beatOffset: number
   beatPeriod: number
@@ -72,118 +76,354 @@ export function analyzeMono(mono: Float32Array, sr: number = ANALYSIS_SR): Analy
   norm(mid, 1, 0.78)
   norm(high, 2, 0.6)
 
-  const bpm = estimateBpm(low, fps)
+  const onset = onsetEnvelope(mono, frames)
+  const est = estimateBpm(onset.all, fps, onset.kick)
   let beatOffset = 0
   let beatPeriod = 0
-  let finalBpm = bpm
-  if (bpm > 0) {
-    const g = refineGrid(low, fps, bpm)
-    finalBpm = Math.round(g.bpm * 10) / 10
-    beatOffset = g.offset
-    beatPeriod = 60 / g.bpm
+  let finalBpm = 0
+  if (est) {
+    finalBpm = est.bpm
+    beatOffset = est.offset
+    beatPeriod = 60 / est.bpm
   }
-  return { wave, fps, frames, duration: n / sr, bpm: finalBpm, beatOffset, beatPeriod, key: detectKey(mono, sr) }
+  return {
+    wave, fps, frames, duration: n / sr, bpm: finalBpm, bpmConf: est?.conf ?? 0, bpmAlt: est?.alt ?? [],
+    beatOffset, beatPeriod, key: detectKey(mono, sr),
+  }
 }
 
 // ------------------------------------------------------------------ BPM
-function attack(env: Float32Array, from: number, m: number): Float32Array {
-  const on = new Float32Array(m)
-  for (let i = 1; i < m; i++) {
-    const d = Math.log1p(env[from + i] * 40) - Math.log1p(env[from + i - 1] * 40)
-    on[i] = d > 0 ? d : 0
-  }
-  return on
-}
+// Fuerza de ataque por cuadro (≈10 ms): flujo espectral logarítmico en 4 bandas. Se calcula sobre el audio
+// a la mitad de frecuencia (11 025 Hz) con una FFT de 512 puntos: separa bien el bombo (30–150 Hz) del bajo
+// (150–400 Hz), cosa que una envolvente de volumen no logra (un bajo sincopado se confundía con el pulso).
+const FFT_N = 512
+const FFT_HOP = HOP / 2
+const BAND_BINS: [number, number, number][] = [
+  // [primer bin, último bin, peso]; cada bin mide 11 025 / 512 ≈ 21.5 Hz
+  [2, 6, 1.0], // 30–150 Hz: bombo
+  [7, 18, 0.7], // 150–400 Hz: bajo
+  [19, 116, 0.5], // 400–2 500 Hz: medios
+  [117, 255, 0.4], // 2 500–5 500 Hz: agudos
+]
 
-/** BPM por autocorrelación de la fuerza de ataque de los graves, con peso a múltiplos del compás. */
-export function estimateBpm(env: Float32Array, fps: number): number {
-  const m = Math.min(env.length, Math.floor(fps * 120)) // máximo 2 min (la parte central basta)
-  const from = Math.max(0, Math.floor((env.length - m) / 2))
-  const on = attack(env, from, m)
-  let mean = 0
-  for (const v of on) mean += v
-  mean /= Math.max(1, m)
-  for (let i = 0; i < m; i++) on[i] = Math.max(0, on[i] - mean)
-
-  const minLag = Math.floor((fps * 60) / 190)
-  const maxLag = Math.ceil((fps * 60) / 60) * 4
-  if (m < maxLag * 2) return 0
-  const ac = new Float32Array(maxLag + 2)
-  for (let lag = minLag; lag <= maxLag + 1; lag++) {
-    let s = 0
-    for (let i = 0; i + lag < m; i++) s += on[i] * on[i + lag]
-    ac[lag] = s / (m - lag)
+/**
+ * Espectro de magnitudes de una señal REAL de FFT_N muestras con una FFT compleja de la mitad de tamaño (se empaquetan
+ * las muestras pares e impares como parte real e imaginaria y se separan después): la mitad de trabajo que una FFT
+ * completa. Devuelve una función que rellena `mag` (FFT_N/2 bins) con la magnitud de cada bin a partir de `x`.
+ */
+function makeSpectrum(): (x: Float32Array, mag: Float32Array) => void {
+  const n = FFT_N
+  const m = n / 2
+  const cos = new Float32Array(m) // cos(2πi/n), i < n/2
+  const sin = new Float32Array(m)
+  for (let i = 0; i < m; i++) {
+    cos[i] = Math.cos((2 * Math.PI * i) / n)
+    sin[i] = Math.sin((2 * Math.PI * i) / n)
   }
-  let best = 0
-  let bestScore = 0
-  const lagMax2 = Math.ceil((fps * 60) / 70)
-  for (let lag = Math.floor((fps * 60) / 180); lag <= lagMax2; lag++) {
-    const score0 = ac[lag] + 0.5 * (ac[lag * 2] ?? 0) + 0.25 * (ac[lag * 4] ?? 0)
-    const bpm = (60 * fps) / lag
-    const prior = Math.exp(-0.5 * Math.pow(Math.log2(bpm / 120) / 0.8, 2)) // leve preferencia por 120
-    const score = score0 * (0.6 + 0.4 * prior)
-    if (score > bestScore) {
-      bestScore = score
-      best = lag
+  const rev = new Uint16Array(m)
+  const bits = Math.log2(m)
+  for (let i = 0; i < m; i++) {
+    let r = 0
+    for (let b = 0; b < bits; b++) if (i & (1 << b)) r |= 1 << (bits - 1 - b)
+    rev[i] = r
+  }
+  const zr = new Float32Array(m)
+  const zi = new Float32Array(m)
+  return (x, mag) => {
+    for (let i = 0; i < m; i++) {
+      const j = rev[i]
+      zr[j] = x[2 * i]
+      zi[j] = x[2 * i + 1]
+    }
+    // FFT compleja de tamaño m (iterativa, mariposas in-place); las tablas son de ángulo 2π/n, de ahí el paso n/size
+    for (let size = 2; size <= m; size <<= 1) {
+      const h = size >> 1
+      const step = n / size
+      for (let start = 0; start < m; start += size) {
+        for (let k = 0, w = 0; k < h; k++, w += step) {
+          const i = start + k
+          const j = i + h
+          const tr = zr[j] * cos[w] + zi[j] * sin[w]
+          const ti = zi[j] * cos[w] - zr[j] * sin[w]
+          zr[j] = zr[i] - tr
+          zi[j] = zi[i] - ti
+          zr[i] += tr
+          zi[i] += ti
+        }
+      }
+    }
+    // Separación de la señal real: X[k] = E[k] + W^k·O[k], con E y O sacados de Z[k] y Z[m-k]
+    mag[0] = Math.abs(zr[0] + zi[0])
+    for (let k = 1; k < m; k++) {
+      const a = zr[k]
+      const b = zi[k]
+      const c = zr[m - k]
+      const d = zi[m - k]
+      const er = 0.5 * (a + c)
+      const ei = 0.5 * (b - d)
+      const or = 0.5 * (b + d)
+      const oi = -0.5 * (a - c)
+      const re = er + cos[k] * or + sin[k] * oi
+      const im = ei + cos[k] * oi - sin[k] * or
+      mag[k] = Math.sqrt(re * re + im * im)
     }
   }
-  if (!best || bestScore <= 0) return 0
-  // Ambigüedad de octava (75 vs 150): si el medio periodo también tiene un ataque claro, el tempo es el doble.
-  while (best > 1) {
-    const half = Math.round(best / 2)
-    if (half < Math.floor((fps * 60) / 180)) break
-    const near = Math.max(ac[half - 1], ac[half], ac[half + 1])
-    if (near < 0.5 * ac[best]) break
-    best = half
+}
+
+/** Solo para pruebas: espectro de magnitudes (FFT_N/2 bins) de FFT_N muestras reales. */
+export function magnitudeSpectrum(frame: Float32Array): Float32Array {
+  const mag = new Float32Array(FFT_N / 2)
+  makeSpectrum()(frame, mag)
+  return mag
+}
+
+export function onsetEnvelope(mono: Float32Array, frames: number): { all: Float32Array; kick: Float32Array } {
+  const n = FFT_N
+  const half = new Float32Array(Math.floor(mono.length / 2))
+  for (let i = 0; i < half.length; i++) half[i] = 0.5 * (mono[2 * i] + mono[2 * i + 1])
+  const win = new Float32Array(n)
+  for (let i = 0; i < n; i++) win[i] = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / n)
+  const spectrum = makeSpectrum()
+  const x = new Float32Array(n)
+  const mag = new Float32Array(n / 2)
+  const prev = new Float32Array(n / 2)
+  const flux = BAND_BINS.map(() => new Float32Array(frames))
+  for (let f = 0; f < frames; f++) {
+    const end = (f + 1) * FFT_HOP // la ventana termina al final del cuadro
+    const start = end - n
+    for (let i = 0; i < n; i++) {
+      const k = start + i
+      x[i] = k >= 0 && k < half.length ? half[k] * win[i] : 0
+    }
+    spectrum(x, mag)
+    for (let bi = 0; bi < BAND_BINS.length; bi++) {
+      const [b0, b1] = BAND_BINS[bi]
+      let sum = 0
+      for (let k = b0; k <= b1; k++) {
+        const l = Math.log1p(mag[k] * 20)
+        const d = l - prev[k]
+        if (d > 0 && f > 0) sum += d
+        prev[k] = l
+      }
+      flux[bi][f] = sum / (b1 - b0 + 1)
+    }
   }
-  const a = ac[best - 1]
-  const b = ac[best]
-  const c = ac[best + 1]
-  const den = a - 2 * b + c
-  const shift = den !== 0 ? (0.5 * (a - c)) / den : 0
-  let bpm = (60 * fps) / (best + Math.max(-1, Math.min(1, shift)))
-  while (bpm < 70) bpm *= 2
-  while (bpm > 180) bpm /= 2
-  return Math.round(bpm * 10) / 10
+  // Cada banda se escala por su percentil 95 para que ninguna aplaste a las demás.
+  const all = new Float32Array(frames)
+  const kick = new Float32Array(frames) // solo bombo y bajo: es lo que marca el pulso en la música de baile
+  flux.forEach((arr, bi) => {
+    const sorted = Float32Array.from(arr).sort()
+    const p = sorted[Math.min(frames - 1, Math.floor(frames * 0.95))] || 1e-6
+    const w = BAND_BINS[bi][2] / p
+    for (let f = 0; f < frames; f++) {
+      all[f] += arr[f] * w
+      if (bi < 2) kick[f] += arr[f] * w
+    }
+  })
+  return { all, kick }
+}
+
+const MIN_BPM = 70
+const MAX_BPM = 180
+/** Al corregir la octava (mitad → doble) no se pasa de aquí: un hip-hop de 90 BPM con hi-hats a corcheas no debe saltar a 180, pero un drum & bass de 176 sí puede venir de 88. */
+const MAX_DOUBLE_BPM = 178
+/** Segundos centrales del tema con los que se puntúan los candidatos de tempo. */
+const SCORE_WINDOW_S = 180
+
+export interface BpmEstimate {
+  bpm: number
+  offset: number
+  /** 0..1: qué tan clara fue la victoria sobre el mejor candidato distinto (poco = dudoso). */
+  conf: number
+  /** Otros tempos plausibles, del más al menos probable. */
+  alt: number[]
 }
 
 /**
- * Afina el BPM (±1) y encuentra la fase de la rejilla: la que hace coincidir más pulsos con ataques de
- * graves en TODO el tema. Así la rejilla no se desplaza aunque el BPM estimado tuviera décimas de error.
+ * BPM: la autocorrelación del flujo espectral combinado de las 4 bandas (`env`) propone varios candidatos (picos) y
+ * cada uno se PUNTÚA además con una rejilla de pulsos sobre bombo y bajo (`kick`, que también decide la octava): gana
+ * el que mejor encaja. Así un pico espurio (p. ej. un bajo sincopado a 5/4 del pulso) no se impone a la rejilla real.
  */
-export function refineGrid(low: Float32Array, fps: number, bpm0: number): { bpm: number; offset: number } {
-  const m = low.length
-  const on = attack(low, 0, m)
+export function estimateBpm(env: Float32Array, fps: number, kick: Float32Array = env): BpmEstimate | null {
+  // `env` y `kick` ya son curvas de ataques (onsetEnvelope): con `env` se proponen candidatos y con `kick` se puntúan.
+  const m = Math.min(env.length, Math.floor(fps * 120)) // máximo 2 min (la parte central basta)
+  const from = Math.max(0, Math.floor((env.length - m) / 2))
+  const minLag = Math.floor((fps * 60) / 190)
+  const maxLag = Math.ceil((fps * 60) / 60) * 4
+  if (m < maxLag * 2) return null
+  const autocorr = (src: Float32Array) => {
+    const x = src.slice(from, from + m)
+    let mu = 0
+    for (const v of x) mu += v
+    mu /= Math.max(1, m)
+    for (let i = 0; i < m; i++) x[i] = Math.max(0, x[i] - mu)
+    const r = new Float32Array(maxLag + 3)
+    for (let lag = minLag; lag <= maxLag + 2; lag++) {
+      let sum = 0
+      for (let i = 0; i + lag < m; i++) sum += x[i] * x[i + lag]
+      r[lag] = sum / (m - lag)
+    }
+    return r
+  }
+  const acAll = autocorr(env)
+  const acKick = autocorr(kick)
+  // Se combinan las dos curvas (cada una normalizada por su propio máximo): los agudos (hi-hats a contratiempo)
+  // pueden proponer un pulso falso que el bombo desmiente, y al revés.
+  let mAll = 1e-9
+  let mKick = 1e-9
+  for (let i = minLag; i < acAll.length; i++) {
+    mAll = Math.max(mAll, acAll[i])
+    mKick = Math.max(mKick, acKick[i])
+  }
+  const ac = new Float32Array(acAll.length)
+  for (let i = minLag; i < ac.length; i++) ac[i] = 0.5 * (acAll[i] / mAll) + 0.5 * (acKick[i] / mKick)
+  // Valor en un lag no entero: el pico real puede caer entre dos cuadros, así que se toma el máximo vecino.
+  const near = (r: Float32Array, x: number) => {
+    const i = Math.round(x)
+    return Math.max(r[i - 1] ?? 0, r[i] ?? 0, r[i + 1] ?? 0)
+  }
+  const acAt = (x: number) => near(ac, x)
+  const lagLo = Math.floor((fps * 60) / MAX_BPM)
+  const lagHi = Math.ceil((fps * 60) / MIN_BPM)
+  const sc = new Float32Array(lagHi + 2)
+  for (let lag = lagLo - 1; lag <= lagHi + 1; lag++) sc[lag] = ac[lag] + 0.5 * acAt(lag * 2) + 0.25 * acAt(lag * 4)
+
+  // Candidatos: picos locales, los mejores primero y separados al menos un 4 %.
+  const peaks: { lag: number; score: number }[] = []
+  for (let lag = lagLo; lag <= lagHi; lag++) {
+    if (sc[lag] > 0 && sc[lag] >= sc[lag - 1] && sc[lag] >= sc[lag + 1]) {
+      const a = sc[lag - 1], b = sc[lag], c = sc[lag + 1]
+      const den = a - 2 * b + c
+      const sh = den !== 0 ? Math.max(-1, Math.min(1, (0.5 * (a - c)) / den)) : 0
+      peaks.push({ lag: lag + sh, score: b })
+    }
+  }
+  peaks.sort((x, y) => y.score - x.score)
+  const cands: { lag: number; score: number }[] = []
+  for (const p of peaks) {
+    if (cands.every((c) => Math.abs(c.lag - p.lag) / c.lag > 0.04)) cands.push(p)
+    if (cands.length >= 6) break
+  }
+  if (!cands.length) return null
+  const top = cands[0].score || 1e-9
+  const prior = (b: number) => Math.exp(-0.5 * Math.pow(Math.log2(b / 120) / 0.8, 2)) // leve preferencia por 120
+  // Cada candidato se puntúa con la periodicidad (autocorrelación) y, de desempate, con qué tan bien encaja
+  // una rejilla de pulsos sobre bombo y bajo en TODA la canción.
+  // Para puntuar candidatos basta la parte central (3 min como máximo): recorrer un mix de 25 min por cada candidato
+  // costaba ~7 veces el análisis anterior. El ajuste final sí recorre la canción entera.
+  const mid = Math.max(0, Math.floor((kick.length - SCORE_WINDOW_S * fps) / 2))
+  const scoreEnv = kick.subarray(mid, mid + Math.floor(SCORE_WINDOW_S * fps))
+  const grids = cands.map((c) => refineGrid(scoreEnv, fps, (60 * fps) / c.lag, { rel: 0.04 }))
+  const gmax = Math.max(1e-9, ...grids.map((g) => g.score))
+  const results = cands.map((c, i) => {
+    const g = grids[i]
+    const total = (c.score / top) * (0.9 + 0.1 * prior(g.bpm)) * (0.85 + 0.15 * (g.score / gmax))
+    return { bpm: g.bpm, lag: c.lag, total }
+  })
+  results.sort((x, y) => y.total - x.total)
+  const best = results[0]
+  if (!(best.total > 0)) return null
+  // Confianza: ventaja sobre el mejor tempo realmente distinto (ni un vecino del mismo pico ni su octava).
+  const distinct = (r: { bpm: number }) => {
+    const q = r.bpm / best.bpm
+    return Math.abs(q - 1) > 0.04 && Math.abs(q - 2) > 0.08 && Math.abs(q - 0.5) > 0.04
+  }
+  const rival = results.find(distinct)
+  const conf = rival ? Math.max(0, Math.min(1, 1 - rival.total / best.total)) : 1
+  // Ambigüedad de octava (72 vs 145): si la mitad del periodo también tiene un ataque claro, el tempo es el doble.
+  let lag = best.lag
+  while (lag > 1) {
+    const half = lag / 2
+    if (half < lagLo || (60 * fps) / half > MAX_DOUBLE_BPM) break
+    if (near(acKick, half) < 0.7 * near(acKick, lag)) break
+    lag = half
+  }
+  const bpmFinal = (60 * fps) / lag
+  const alt: number[] = []
+  for (const r of results) {
+    const v = Math.round(r.bpm * 10) / 10
+    if (Math.abs(r.bpm / bpmFinal - 1) > 0.04 && !alt.some((x) => Math.abs(x / v - 1) < 0.04)) alt.push(v)
+    if (alt.length >= 3) break
+  }
+  // Ajuste final sobre la canción entera en dos pasos: primero solo la FASE con el BPM fijo (así no se confunde con
+  // contratiempos) y luego un retoque de ±0,3 BPM sin dejar que la fase se aleje más de 30 ms de la ya elegida.
+  const g1 = refineGrid(kick, fps, bpmFinal, { abs: 0 })
+  const g = refineGrid(kick, fps, g1.bpm, { abs: 0.3 }, { center: g1.offset * fps, span: 0.03 * fps })
+  return { bpm: Math.round(g.bpm * 10) / 10, offset: g.offset, conf, alt }
+}
+
+/**
+ * Afina el BPM (±span) y encuentra la fase de la rejilla: la que hace coincidir más pulsos con ataques de
+ * graves en TODO el tema. Así la rejilla no se desplaza aunque el BPM estimado tuviera décimas de error.
+ * `score` mide cuánta fuerza de ataque hay en los pulsos menos la mitad de la que hay a medio pulso
+ * (penaliza rejillas a mitad de la velocidad real, donde los golpes quedan entre pulsos).
+ */
+export function refineGrid(
+  onset: Float32Array,
+  fps: number,
+  bpm0: number,
+  /** Cuánto se prueba alrededor de bpm0: `rel` (fracción, p. ej. 0.04 = ±4 %) o `abs` (BPM). */
+  range: { rel?: number; abs?: number } = { rel: 1 / 120 },
+  /** Si se da, solo se prueban fases a ±span cuadros de center (cuadros): evita que un BPM ligeramente distinto «persiga» golpes lejanos. */
+  near?: { center: number; span: number },
+): { bpm: number; offset: number; score: number } {
+  const m = onset.length
+  const on = onset
   // suavizado de 3 puntos: tolera medio cuadro de error
   const s = new Float32Array(m)
   for (let i = 1; i < m - 1; i++) s[i] = 0.25 * on[i - 1] + 0.5 * on[i] + 0.25 * on[i + 1]
+  // Se resta el nivel de fondo (media): solo cuentan los ataques que sobresalen.
+  let avg = 0
+  for (let i = 0; i < m; i++) avg += s[i]
+  avg /= Math.max(1, m)
+  for (let i = 0; i < m; i++) s[i] = Math.max(0, s[i] - avg)
   const at = (t: number) => {
     const i = Math.floor(t)
     if (i < 0 || i >= m - 1) return 0
     const f = t - i
     return s[i] * (1 - f) + s[i + 1] * f
   }
+  // Un ataque «fuerte» es el percentil 95 del tema. Se mide cuánta fuerza hay en los puntos de la rejilla
+  // (desplazada `shift` de pulso): el pulso real es donde caen los golpes MÁS fuertes (bombo), no los débiles.
+  const sorted = Float32Array.from(s).sort()
+  const thr = Math.max(1e-6, sorted[Math.min(m - 1, Math.floor(m * 0.95))])
+  const hits = (b: number, ph: number, shift: number) => {
+    const P = (60 * fps) / b
+    let sum = 0
+    let cnt = 0
+    for (let t = ph + shift * P; t < m - 1; t += P) {
+      sum += Math.min(1.5, at(t) / thr)
+      cnt++
+    }
+    return cnt ? sum / cnt : 0
+  }
+  const delta = range.abs ?? bpm0 * (range.rel ?? 0)
+  const lo = bpm0 - delta
+  const hi = bpm0 + delta
+  const step = Math.max(0.02, (hi - lo) / 100)
   let bestScore = -1
   let bestBpm = bpm0
   let bestPhase = 0
-  for (let b = bpm0 - 1; b <= bpm0 + 1.0001; b += 0.02) {
+  for (let b = lo; b <= hi + 1e-6; b += step) {
     const P = (60 * fps) / b
-    for (let ph = 0; ph < P; ph += 0.5) {
+    for (let d = near ? -near.span : 0; d <= (near ? near.span : P); d += 0.5) {
+      const ph = near ? (((near.center + d) % P) + P) % P : d
+      if (!near && ph >= P) break
       let sum = 0
       let cnt = 0
       for (let t = ph; t < m - 1; t += P) {
         sum += at(t)
         cnt++
       }
-      const sc = cnt ? sum / cnt : 0
-      if (sc > bestScore) {
-        bestScore = sc
+      const v = cnt ? sum / cnt : 0
+      if (v > bestScore) {
+        bestScore = v
         bestBpm = b
         bestPhase = ph
       }
     }
   }
-  return { bpm: bestBpm, offset: bestPhase / fps }
+  return { bpm: bestBpm, offset: bestPhase / fps, score: Math.max(0, hits(bestBpm, bestPhase, 0) - 0.5 * hits(bestBpm, bestPhase, 0.5)) }
 }
 
 // ------------------------------------------------------------------ tonalidad

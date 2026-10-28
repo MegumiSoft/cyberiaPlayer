@@ -3,7 +3,7 @@ import { computed, nextTick, ref, watch } from 'vue'
 import { api } from '../api'
 import { errorText } from '../format'
 import { current, next, player, stop } from '../player/engine'
-import { moveTrackTo } from '../player/trackops'
+import { copyTrackTo, moveTrackTo } from '../player/trackops'
 import { metas } from '../player/trackmeta'
 import { loadLibrary, state, toast } from '../store'
 import type { LibPlaylist } from '../types'
@@ -13,7 +13,9 @@ import type { LibPlaylist } from '../types'
 const norm = (s: string) => s.normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase()
 const trashing = ref<{ path: string; title: string; from: string } | null>(null)
 const cancelBtn = ref<HTMLButtonElement>()
-const move = (path: string, dest: LibPlaylist) => moveTrackTo(path, dest.path, dest.name)
+// Por defecto se MUEVE; marcando la casilla se COPIA (la canción queda en las dos playlists).
+const copyMode = ref(false)
+const move = (path: string, dest: LibPlaylist) => (copyMode.value ? copyTrackTo(path, dest.path, dest.name) : moveTrackTo(path, dest.path, dest.name))
 
 // ---- selector de destino con búsqueda ----
 const picking = ref<{ path: string; title: string; from: string } | null>(null)
@@ -46,6 +48,7 @@ async function openPicker(t: { path: string; title: string; from: string }) {
   picking.value = { path: t.path, title: t.title, from: t.from }
   pickQuery.value = ''
   pickIdx.value = 0
+  copyMode.value = false
   await nextTick()
   pickInput.value?.focus()
 }
@@ -63,7 +66,7 @@ async function choosePick(i: number) {
     closePicker()
     try {
       const rel = await api.createPlaylist(name)
-      await moveTrackTo(cur.path, rel, rel)
+      await (copyMode.value ? copyTrackTo(cur.path, rel, rel) : moveTrackTo(cur.path, rel, rel))
     } catch (e) {
       toast(errorText(e))
     }
@@ -132,7 +135,7 @@ defineExpose({ openPicker, askTrash })
       </div>
       <div v-if="picking" class="modal" @mousedown.self="closePicker">
         <div class="dialog" role="dialog" aria-label="Mover canción">
-          <div class="cap">Mover canción</div>
+          <div class="cap">{{ copyMode ? 'Copiar canción' : 'Mover canción' }}</div>
           <div class="dlg-title">{{ picking.title }}</div>
           <div class="hint" style="margin-bottom: 8px">DESDE «{{ picking.from.toUpperCase() }}»</div>
           <input
@@ -143,6 +146,9 @@ defineExpose({ openPicker, askTrash })
             spellcheck="false"
             @keydown="onPickKey"
           />
+          <label class="check copyopt" title="La canción queda en la playlist de origen y también en la de destino">
+            <input v-model="copyMode" type="checkbox" /> COPIAR EN VEZ DE MOVER (QUEDA EN LAS DOS PLAYLISTS)
+          </label>
           <ul class="pick">
             <li
               v-for="(r, i) in pickResults"
@@ -160,12 +166,12 @@ defineExpose({ openPicker, askTrash })
               @mouseenter="pickIdx = pickResults.length"
               @click="choosePick(pickResults.length)"
             >
-              + Crear «{{ pickQuery.trim() }}» y mover aquí
+              + Crear «{{ pickQuery.trim() }}» y {{ copyMode ? 'copiar' : 'mover' }} aquí
             </li>
             <li v-if="!pickResults.length && !canCreate" class="none">Escribe un nombre.</li>
           </ul>
           <div class="row spread" style="margin-top: 10px">
-            <span class="hint">↑↓ ELEGIR · ENTER MOVER · ESC CANCELAR</span>
+            <span class="hint">↑↓ ELEGIR · ENTER {{ copyMode ? 'COPIAR' : 'MOVER' }} · ESC CANCELAR</span>
             <button class="btn small" @click="closePicker">Cancelar</button>
           </div>
         </div>

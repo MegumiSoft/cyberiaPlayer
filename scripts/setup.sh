@@ -85,7 +85,9 @@ if have go; then
 fi
 if have npm; then
   say "Instalando dependencias de la interfaz (src/frontend)"
-  npm install --prefix src/frontend --no-audit --no-fund
+  # `npm ci` instala EXACTAMENTE lo que dice package-lock.json (todos los sistemas comparten las mismas versiones) y
+  # borra node_modules antes, así que no arrastra restos de otra instalación.
+  npm ci --prefix src/frontend --no-audit --no-fund
 fi
 
 say "Listo"

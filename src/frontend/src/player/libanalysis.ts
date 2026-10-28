@@ -2,7 +2,7 @@
 import { reactive } from 'vue'
 import { api } from '../api'
 import type { LibTrack } from '../types'
-import { analyze, ANALYSIS_VERSION, MAX_ANALYZE_BYTES, type Analysis } from './analysis'
+import { analyze, analyzeViaBackend, ANALYSIS_VERSION, isTooLongError, needsBackendDecode, StaleAnalysis, type Analysis } from './analysis'
 import { b64ToBytes, bytesToB64 } from './bytes'
 import { metaOf, updateMeta } from './trackmeta'
 
@@ -12,7 +12,7 @@ export const batch = reactive({ running: false, done: 0, total: 0, current: '', 
 export function persistAnalysis(track: LibTrack, a: Analysis): void {
   updateMeta(track.path, (m) => {
     m.analysis = {
-      size: track.size, version: ANALYSIS_VERSION, duration: a.duration, bpm: a.bpm, beatOffset: a.beatOffset,
+      size: track.size, version: ANALYSIS_VERSION, duration: a.duration, bpm: a.bpm, bpmConf: a.bpmConf, bpmAlt: a.bpmAlt, beatOffset: a.beatOffset,
       keyPc: a.key?.pc ?? 0, keyMinor: a.key?.minor ?? false, keyConf: a.key?.conf ?? 0, hasKey: !!a.key,
     }
   })
@@ -24,8 +24,18 @@ export const isAnalyzed = (t: LibTrack): boolean => {
   return !!a && a.version === ANALYSIS_VERSION && a.size === t.size
 }
 
-/** Pendientes: sin análisis vigente y de un tamaño que se puede decodificar. */
-export const pendingTracks = (tracks: LibTrack[]): LibTrack[] => tracks.filter((t) => !isAnalyzed(t) && t.size <= MAX_ANALYZE_BYTES)
+/** Debe coincidir con decode.MaxSeconds del backend: más allá es un mix largo y no se analiza. */
+export const MAX_ANALYZE_SECONDS = 30 * 60
+
+/** Rutas que el backend ya rechazó por durar más de 30 min: no se vuelven a intentar (ni cuentan como pendientes). */
+const tooLong = new Set<string>()
+
+/**
+ * Pendientes: las que no tienen un análisis vigente y que se pueden analizar. Quedan fuera las que ya se sabe que
+ * pasan de 30 min: la duración conocida (`durations`, p. ej. state.durations) o un rechazo previo del backend.
+ */
+export const pendingTracks = (tracks: LibTrack[], durations: Record<string, number | undefined> = {}): LibTrack[] =>
+  tracks.filter((t) => !isAnalyzed(t) && !tooLong.has(t.path) && (durations[t.path] ?? 0) <= MAX_ANALYZE_SECONDS)
 
 const CHUNK = 1 << 20
 async function readWhole(track: LibTrack): Promise<ArrayBuffer> {
@@ -38,9 +48,9 @@ async function readWhole(track: LibTrack): Promise<ArrayBuffer> {
 }
 
 /** Analiza de a una canción (el cálculo pesado corre en un Worker) y guarda cada resultado al terminar. */
-export async function analyzeAll(tracks: LibTrack[]): Promise<void> {
+export async function analyzeAll(tracks: LibTrack[], durations: Record<string, number | undefined> = {}): Promise<void> {
   if (batch.running) return
-  const todo = pendingTracks(tracks)
+  const todo = pendingTracks(tracks, durations)
   batch.running = true
   batch.cancel = false
   batch.done = 0
@@ -51,9 +61,11 @@ export async function analyzeAll(tracks: LibTrack[]): Promise<void> {
       if (batch.cancel) break
       batch.current = t.title
       try {
-        persistAnalysis(t, await analyze(await readWhole(t)))
-      } catch {
-        batch.failed++
+        persistAnalysis(t, needsBackendDecode(t) ? await analyzeViaBackend(t.path, () => batch.cancel) : await analyze(await readWhole(t)))
+      } catch (e) {
+        if (e instanceof StaleAnalysis) break // se pulsó DETENER
+        if (isTooLongError(e)) tooLong.add(t.path)
+        else batch.failed++
       }
       batch.done++
       await new Promise((r) => setTimeout(r, 150)) // deja respirar a la interfaz y al reproductor
