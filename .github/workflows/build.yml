@@ -26,18 +26,21 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - name: Instalar yt-dlp y ffmpeg (para los tests de integración)
+      - name: Instalar yt-dlp, ffmpeg y las librerías de Wails (para los tests de integración y para compilar src/backend)
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          sudo apt-get install -y ffmpeg libgtk-3-dev libwebkit2gtk-4.1-dev
           python3 -m pip install --user -r requirements.txt
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-      - name: Tests del backend (subpaquetes, sin Wails)
-        run: go test -race -count=1 ./src/backend/*/...
-      - name: Typecheck y build del frontend
+      - name: Tests del backend (src/backend y subpaquetes)
+        # `./src/backend/...` incluye el paquete principal (CopyTrack, ConvertTracks…), que importa Wails y por eso necesita las
+        # librerías GTK/WebKit instaladas arriba (en Ubuntu 24.04 es WebKitGTK 4.1, de ahí la etiqueta webkit2_41).
+        run: go test -race -count=1 -tags webkit2_41 ./src/backend/...
+      - name: Tests, typecheck y build del frontend
         working-directory: src/frontend
         run: |
-          npm install --no-audit --no-fund
+          npm ci --no-audit --no-fund
+          npm test
           npm run build
 
   build:
@@ -100,7 +103,12 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      - name: Sumas SHA-256 de los zips
+        working-directory: dist
+        run: sha256sum *.zip > SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
-          files: dist/*.zip
+          files: |
+            dist/*.zip
+            dist/SHA256SUMS
           generate_release_notes: true

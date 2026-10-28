@@ -45,3 +45,30 @@ func TestToPCMFlacAndWav(t *testing.T) {
 		t.Fatal("debió fallar")
 	}
 }
+
+func TestTooLongIsRejectedWithoutDecoding(t *testing.T) {
+	ff, err := exec.LookPath("ffmpeg")
+	if err != nil {
+		t.Skip("ffmpeg no está instalado")
+	}
+	dir := t.TempDir()
+	long := filepath.Join(dir, "mix.wav")
+	// 31 min de silencio a 8 kHz mono (~30 MB): pasa de MaxSeconds
+	if out, err := exec.Command(ff, "-v", "error", "-f", "lavfi", "-i", "anullsrc=r=8000:cl=mono", "-t", "1860", "-y", long).CombinedOutput(); err != nil {
+		t.Fatalf("%v %s", err, out)
+	}
+	d, ok := Duration(context.Background(), ff, long, nil)
+	if !ok || d < 1859 || d > 1861 {
+		t.Fatalf("duración leída: %v ok=%v", d, ok)
+	}
+	pcm := filepath.Join(dir, "mix.pcm")
+	if _, err := ToPCM(context.Background(), ff, long, pcm, nil); err != ErrTooLong {
+		t.Fatalf("esperaba ErrTooLong, obtuve %v", err)
+	}
+	if _, err := os.Stat(pcm); err == nil {
+		t.Fatal("no debió decodificar (ni dejar archivo) para un audio demasiado largo")
+	}
+	if _, ok := Duration(context.Background(), ff, filepath.Join(dir, "no-existe.wav"), nil); ok {
+		t.Fatal("un archivo inexistente no tiene duración")
+	}
+}

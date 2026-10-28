@@ -1,4 +1,4 @@
-import type { ConvertProgress, ConvertRequest, ConvertResult, Job, LibraryResult, NewJob, PreviewResult, Settings, ToolStatus, TrackMeta, Loudness, NormalizeResult, SetResult, USBInfo, USBPreview, USBRequest, USBStatus, USBVolume } from './types'
+import type { ConvertFormatsInfo, ConvertProgress, ConvertRequest, ConvertResult, Job, LibraryResult, NewJob, PreviewResult, Settings, ToolStatus, TrackMeta, Loudness, NormalizeResult, SetResult, USBInfo, USBPreview, USBRequest, USBStatus, USBVolume } from './types'
 import { ACTIVE } from './types'
 
 // Puente hacia el backend en Go. Dentro de Wails, `window.go.<paquete>.App.*` y `window.runtime`
@@ -40,9 +40,12 @@ export interface Api {
   toggleFullscreen(): Promise<boolean>
   copyTrack(path: string, destDir: string): Promise<string>
   createPlaylistFromSet(name: string, paths: string[]): Promise<SetResult>
-  prepareAnalysis(path: string): Promise<number>
-  readAnalysisChunk(path: string, offset: number, length: number): Promise<string>
-  releaseAnalysis(path: string): Promise<void>
+  /** `handle` lo elige quien llama (único por análisis): así dos análisis de la misma canción no se pisan y se puede cancelar. */
+  prepareAnalysis(handle: string, path: string): Promise<number>
+  readAnalysisChunk(handle: string, offset: number, length: number): Promise<string>
+  cancelAnalysis(handle: string): Promise<void>
+  releaseAnalysis(handle: string): Promise<void>
+  convertFormats(): Promise<ConvertFormatsInfo>
   measureLoudness(path: string): Promise<Loudness>
   normalizeTrack(path: string, refPath: string): Promise<NormalizeResult>
   usbVolumes(): Promise<USBVolume[]>
@@ -116,9 +119,11 @@ const real: Api = {
   toggleFullscreen: () => call('ToggleFullscreen'),
   copyTrack: (path, destDir) => call('CopyTrack', path, destDir),
   createPlaylistFromSet: (name, paths) => call('CreatePlaylistFromSet', name, paths),
-  prepareAnalysis: (path) => call('PrepareAnalysis', path),
-  readAnalysisChunk: (path, offset, length) => call('ReadAnalysisChunk', path, offset, length),
-  releaseAnalysis: (path) => call('ReleaseAnalysis', path),
+  prepareAnalysis: (handle, path) => call('PrepareAnalysis', handle, path),
+  readAnalysisChunk: (handle, offset, length) => call('ReadAnalysisChunk', handle, offset, length),
+  cancelAnalysis: (handle) => call('CancelAnalysis', handle),
+  releaseAnalysis: (handle) => call('ReleaseAnalysis', handle),
+  convertFormats: () => call('ConvertFormats'),
   measureLoudness: (path) => call('MeasureLoudness', path),
   normalizeTrack: (path, ref) => call('NormalizeTrack', path, ref),
   usbVolumes: () => call('USBVolumes'),
@@ -259,7 +264,7 @@ function createMock(): Api {
     copyTrack: async (path, destDir) => `${destDir}/${path.split('/').pop()}`,
     createPlaylistFromSet: async (name, paths) => ({ folder: name, copied: paths.length, skipped: null }),
     // Simulador: decodifica en el navegador para poder probar el flujo de WAV/FLAC sin backend.
-    prepareAnalysis: async (path) => {
+    prepareAnalysis: async (handle, path) => {
       const lib = mockLibrary()
       const url = `${lib.baseUrl}/f/${path.split('/').map(encodeURIComponent).join('/')}`
       const data = await (await fetch(url)).arrayBuffer()
@@ -268,16 +273,28 @@ function createMock(): Api {
       const ch = buf.getChannelData(0)
       const pcm = new Int16Array(ch.length)
       for (let i = 0; i < ch.length; i++) pcm[i] = Math.max(-1, Math.min(1, ch[i])) * 32767
-      mockPcm[path] = new Uint8Array(pcm.buffer)
+      mockPcm[handle] = new Uint8Array(pcm.buffer)
       return pcm.byteLength
     },
-    readAnalysisChunk: async (path, offset, length) => {
-      const b = mockPcm[path].subarray(offset, offset + length)
+    readAnalysisChunk: async (handle, offset, length) => {
+      const b = mockPcm[handle].subarray(offset, offset + length)
       let bin = ''
       for (let i = 0; i < b.length; i += 0x8000) bin += String.fromCharCode(...b.subarray(i, i + 0x8000))
       return btoa(bin)
     },
-    releaseAnalysis: async (path) => void delete mockPcm[path],
+    cancelAnalysis: async () => undefined,
+    releaseAnalysis: async (handle) => void delete mockPcm[handle],
+    convertFormats: async () => ({
+      formats: [
+        { id: 'mp3', label: 'MP3', lossy: true, default: 320, bitrates: [320, 256, 192, 128], vbr: [0, 2] },
+        { id: 'm4a', label: 'M4A (AAC)', lossy: true, default: 256, bitrates: [320, 256, 192, 128], vbr: [] },
+        { id: 'opus', label: 'OPUS', lossy: true, default: 160, bitrates: [256, 192, 160, 128, 96], vbr: [] },
+        { id: 'aac', label: 'AAC (.aac, sin etiquetas)', lossy: true, default: 256, bitrates: [320, 256, 192, 128], vbr: [] },
+        { id: 'flac', label: 'FLAC', lossy: false, default: 0, bitrates: [], vbr: [] },
+        { id: 'wav', label: 'WAV', lossy: false, default: 0, bitrates: [], vbr: [] },
+      ],
+      lossyExts: ['mp3', 'm4a', 'aac', 'opus', 'ogg', 'oga'],
+    }),
     previewUrls: async (urls) => {
       await new Promise((r) => setTimeout(r, 500))
       return urls.map((url) => {
@@ -409,7 +426,7 @@ function createMock(): Api {
     cancelUsbExport: async () => undefined,
     convertTracks: async (req) => {
       convCancel = false
-      const res: ConvertResult = { converted: 0, trashed: 0, folder: req.mode === 'playlist' ? req.newName : '', skipped: [], failed: [], bytesBefore: 0, bytesAfter: 0, canceled: false }
+      const res: ConvertResult = { converted: 0, copied: 0, trashed: 0, folder: req.mode === 'playlist' ? req.newName : '', skipped: [], failed: [], bytesBefore: 0, bytesAfter: 0, canceled: false }
       for (let i = 0; i < req.rels.length; i++) {
         if (convCancel) {
           res.canceled = true
@@ -418,8 +435,10 @@ function createMock(): Api {
         const name = req.rels[i].split('/').pop() ?? ''
         convSubs.forEach((cb) => cb({ done: i, total: req.rels.length, current: name }))
         await new Promise((r) => setTimeout(r, 250))
-        if (name.toLowerCase().endsWith('.' + req.format)) res.skipped!.push(`${name}: ya está en ${req.format.toUpperCase()}`)
-        else {
+        if (name.toLowerCase().endsWith('.' + req.format)) {
+          if (req.mode === 'playlist') res.copied++
+          else res.skipped!.push(`${name}: ya está en ${req.format.toUpperCase()}`)
+        } else {
           res.converted++
           res.bytesBefore += 30_000_000
           res.bytesAfter += req.format === 'wav' || req.format === 'flac' ? 28_000_000 : 8_000_000

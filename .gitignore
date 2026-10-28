@@ -4,8 +4,8 @@ src/frontend/dist/*
 !src/frontend/dist/.gitkeep
 src/frontend/node_modules/
 src/frontend/package-lock.json.bak
-# El lockfile se generó en otro sistema y rompe las dependencias nativas (rollup/esbuild) en otros; cada quien resuelve las suyas
-src/frontend/package-lock.json
+# Zips que genera scripts/build.sh --zip
+/dist/
 
 # Wails genera esto en cada build/dev
 src/frontend/wailsjs/
