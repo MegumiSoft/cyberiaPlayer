@@ -17,9 +17,6 @@ for arg in "$@"; do
     *) echo "Opción desconocida: $arg"; exit 2 ;;
   esac
 done
-OS="$(uname -s)"
-[ "$UNIVERSAL" = 1 ] && [ "$OS" != "Darwin" ] && echo "Aviso: --universal solo aplica en macOS; se ignora en $OS."
-[ "$ZIP" = 1 ] && case "$OS" in Darwin|MINGW*|MSYS*|CYGWIN*) ;; *) echo "--zip solo está soportado en macOS y Windows (en $OS wails genera build/bin/Cyberia sin .exe ni .app)."; exit 2 ;; esac
 command -v wails >/dev/null 2>&1 || { echo "No encuentro 'wails'. Ejecuta ./scripts/setup.sh (y agrega \$(go env GOPATH)/bin a tu PATH)."; exit 1; }
 
 mkdir -p src/frontend/dist && touch src/frontend/dist/.gitkeep
@@ -51,7 +48,7 @@ if [ "$(uname -s)" = "Darwin" ]; then
     ditto -c -k --sequesterRsrc --keepParent "$APP" dist/Cyberia-macos.zip
     echo "Zip para compartir: dist/Cyberia-macos.zip"
     echo "Quien lo descargue debe: descomprimir, mover Cyberia.app a Aplicaciones y ejecutar una vez:"
-    echo "    xattr -dr com.apple.quarantine /Applications/Cyberia.app"
+    echo "    xattr -cr /Applications/Cyberia.app"
     echo "(o: Ajustes del Sistema → Privacidad y seguridad → «Abrir de todos modos»)"
   fi
 else
@@ -59,8 +56,7 @@ else
   echo "OK: la app quedó en build/bin/"
   if [ "$ZIP" = 1 ]; then
     mkdir -p dist
-    EXE_FILE=$(ls build/bin/*.exe 2>/dev/null | head -1 || true)
-    [ -n "$EXE_FILE" ] || { echo "No hay ningún .exe en build/bin: ¿falló la compilación?"; exit 1; }
+    EXE_FILE=$(ls build/bin/*.exe | head -1)
     ( cd build/bin && powershell -NoProfile -Command "Compress-Archive -Force -Path '$(basename "$EXE_FILE")' -DestinationPath '../../dist/Cyberia-windows.zip'" 2>/dev/null ) \
       || ( cd build/bin && zip -q ../../dist/Cyberia-windows.zip "$(basename "$EXE_FILE")" )
     echo "Zip para compartir: dist/Cyberia-windows.zip"

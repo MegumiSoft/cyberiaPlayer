@@ -52,37 +52,17 @@ export interface Cue {
   color: number
 }
 
-export type ConvertFormat = 'mp3' | 'm4a' | 'opus' | 'aac' | 'flac' | 'wav'
+export type ConvertFormat = 'mp3' | 'm4a' | 'opus' | 'flac' | 'wav'
 export type ConvertMode = 'keep' | 'playlist' | 'replace'
 export interface ConvertRequest {
   rels: string[]
   format: ConvertFormat
-  /** kbps de tasa fija; null = el predeterminado del formato (se ignora en FLAC/WAV). */
-  bitrate: number | null
-  /** Calidad VBR (solo MP3; 0 = la mejor); null = tasa fija. */
-  vbr: number | null
+  bitrate: number
   mode: ConvertMode
   newName: string
 }
-
-/** Un formato de salida tal como lo describe el backend. */
-export interface ConvertFormatInfo {
-  id: ConvertFormat
-  label: string
-  lossy: boolean
-  default: number
-  bitrates: number[]
-  vbr: number[]
-}
-export interface ConvertFormatsInfo {
-  formats: ConvertFormatInfo[]
-  /** Extensiones de origen con pérdida (sin punto). */
-  lossyExts: string[]
-}
 export interface ConvertResult {
   converted: number
-  /** Modo playlist: las que ya estaban en el formato y se copiaron tal cual. */
-  copied: number
   trashed: number
   folder: string
   skipped: string[] | null

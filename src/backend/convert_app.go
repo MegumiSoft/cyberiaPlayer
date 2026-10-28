@@ -21,12 +21,10 @@ import (
 // ConvertRequest pide convertir canciones de la biblioteca a otro formato.
 type ConvertRequest struct {
 	Rels    []string `json:"rels"`    // canciones (ruta relativa) a convertir
-	Format  string   `json:"format"`  // mp3, m4a, opus, aac, flac, wav
-	Bitrate *int     `json:"bitrate"` // kbps de tasa fija; null = el predeterminado; se ignora en flac/wav
-	VBR     *int     `json:"vbr"`     // calidad VBR (solo MP3: 0 = la mejor); null = tasa fija
-	// Mode: "keep" deja los originales y los nuevos al lado; "playlist" crea una playlist nueva COMPLETA (convierte
-	// lo que hace falta y copia las que ya estaban en el formato); "replace" manda los originales a la papelera
-	// cuando su copia convertida ya existe.
+	Format  string   `json:"format"`  // mp3, m4a, opus, flac, wav
+	Bitrate int      `json:"bitrate"` // kbps (0 = el predeterminado); se ignora en flac/wav
+	// Mode: "keep" deja los originales y los nuevos al lado; "playlist" crea una playlist nueva solo con los
+	// convertidos; "replace" manda los originales a la papelera cuando su copia convertida ya existe.
 	Mode    string `json:"mode"`
 	NewName string `json:"newName"` // nombre de la playlist nueva (modo "playlist")
 }
@@ -34,7 +32,6 @@ type ConvertRequest struct {
 // ConvertResult resume lo ocurrido.
 type ConvertResult struct {
 	Converted   int      `json:"converted"`
-	Copied      int      `json:"copied"` // modo "playlist": las que ya estaban en el formato y se copiaron tal cual
 	Trashed     int      `json:"trashed"`
 	Folder      string   `json:"folder"` // playlist creada (modo "playlist")
 	Skipped     []string `json:"skipped"`
@@ -49,20 +46,6 @@ type ConvertProgress struct {
 	Done    int    `json:"done"`
 	Total   int    `json:"total"`
 	Current string `json:"current"`
-}
-
-// trashFile manda un archivo a la papelera del sistema; es una variable para que los tests no toquen la real.
-var trashFile = trash.Move
-
-// ConvertFormatsInfo es lo que la interfaz necesita para armar el diálogo de conversión.
-type ConvertFormatsInfo struct {
-	Formats   []convert.Format `json:"formats"`
-	LossyExts []string         `json:"lossyExts"` // extensiones de origen con pérdida (sin punto)
-}
-
-// ConvertFormats lista los formatos de salida, sus calidades y qué extensiones son con pérdida.
-func (a *App) ConvertFormats() ConvertFormatsInfo {
-	return ConvertFormatsInfo{Formats: convert.Formats(), LossyExts: convert.LossyExts()}
 }
 
 var convState struct {
@@ -92,10 +75,6 @@ func (a *App) ConvertTracks(req ConvertRequest) (ConvertResult, error) {
 	f, ok := convert.Lookup(req.Format)
 	if !ok {
 		return res, fmt.Errorf("formato desconocido: %s", req.Format)
-	}
-	opts := convert.Options{Bitrate: req.Bitrate, VBR: req.VBR}
-	if err := convert.Validate(req.Format, opts); err != nil {
-		return res, err
 	}
 	if len(req.Rels) == 0 {
 		return res, errors.New("no hay canciones que convertir")
@@ -144,20 +123,20 @@ func (a *App) ConvertTracks(req ConvertRequest) (ConvertResult, error) {
 		}
 		name := path.Base(rel)
 		a.emitConvert(ConvertProgress{Done: i, Total: total, Current: name})
-		a.convertOne(ctx, runner, f, req, opts, rel, folder, root, &res)
+		a.convertOne(ctx, runner, f, req, rel, folder, root, &res)
 	}
 	if ctx.Err() != nil {
 		res.Canceled = true
 	}
 	a.emitConvert(ConvertProgress{Done: total, Total: total})
-	if req.Mode == "playlist" && res.Converted+res.Copied == 0 {
+	if req.Mode == "playlist" && res.Converted == 0 {
 		_ = os.Remove(filepath.Join(root, filepath.FromSlash(folder))) // carpeta vacía: no dejarla
 		res.Folder = ""
 	}
 	return res, nil
 }
 
-func (a *App) convertOne(ctx context.Context, r convert.Runner, f convert.Format, req ConvertRequest, opts convert.Options, rel, folder, root string, res *ConvertResult) {
+func (a *App) convertOne(ctx context.Context, r convert.Runner, f convert.Format, req ConvertRequest, rel, folder, root string, res *ConvertResult) {
 	name := path.Base(rel)
 	src, err := library.ResolveFile(root, rel)
 	if err != nil {
@@ -165,17 +144,6 @@ func (a *App) convertOne(ctx context.Context, r convert.Runner, f convert.Format
 		return
 	}
 	if strings.EqualFold(path.Ext(rel), f.Ext) {
-		if req.Mode == "playlist" {
-			// La playlist nueva debe quedar completa: lo que ya está en el formato se copia tal cual (con sus cues y rejilla).
-			nuevo, err := library.CopyTrack(root, rel, folder, "")
-			if err != nil {
-				res.Failed = append(res.Failed, name+": "+err.Error())
-				return
-			}
-			_ = a.meta.Copy(rel, filepath.ToSlash(nuevo))
-			res.Copied++
-			return
-		}
 		res.Skipped = append(res.Skipped, name+": ya está en "+strings.ToUpper(strings.TrimPrefix(f.Ext, ".")))
 		return
 	}
@@ -197,7 +165,7 @@ func (a *App) convertOne(ctx context.Context, r convert.Runner, f convert.Format
 		res.Skipped = append(res.Skipped, name+": ya existe "+path.Base(destRel))
 		return
 	}
-	if err := r.Convert(ctx, src, dest, req.Format, opts); err != nil {
+	if err := r.Convert(ctx, src, dest, req.Format, req.Bitrate); err != nil {
 		if ctx.Err() != nil {
 			return
 		}
@@ -213,7 +181,7 @@ func (a *App) convertOne(ctx context.Context, r convert.Runner, f convert.Format
 		_ = a.meta.Resize(destRel, srcInfo.Size(), st.Size())
 	}
 	if req.Mode == "replace" {
-		if err := trashFile(src); err != nil {
+		if err := trash.Move(src); err != nil {
 			res.Failed = append(res.Failed, name+": se convirtió, pero el original no se pudo mandar a la papelera ("+err.Error()+")")
 			return
 		}

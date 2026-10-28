@@ -106,75 +106,32 @@ const BAND_BINS: [number, number, number][] = [
   [117, 255, 0.4], // 2 500–5 500 Hz: agudos
 ]
 
-/**
- * Espectro de magnitudes de una señal REAL de FFT_N muestras con una FFT compleja de la mitad de tamaño (se empaquetan
- * las muestras pares e impares como parte real e imaginaria y se separan después): la mitad de trabajo que una FFT
- * completa. Devuelve una función que rellena `mag` (FFT_N/2 bins) con la magnitud de cada bin a partir de `x`.
- */
-function makeSpectrum(): (x: Float32Array, mag: Float32Array) => void {
+function fftMags(re: Float32Array, im: Float32Array, cos: Float32Array, sin: Float32Array, rev: Uint16Array): void {
   const n = FFT_N
-  const m = n / 2
-  const cos = new Float32Array(m) // cos(2πi/n), i < n/2
-  const sin = new Float32Array(m)
-  for (let i = 0; i < m; i++) {
-    cos[i] = Math.cos((2 * Math.PI * i) / n)
-    sin[i] = Math.sin((2 * Math.PI * i) / n)
-  }
-  const rev = new Uint16Array(m)
-  const bits = Math.log2(m)
-  for (let i = 0; i < m; i++) {
-    let r = 0
-    for (let b = 0; b < bits; b++) if (i & (1 << b)) r |= 1 << (bits - 1 - b)
-    rev[i] = r
-  }
-  const zr = new Float32Array(m)
-  const zi = new Float32Array(m)
-  return (x, mag) => {
-    for (let i = 0; i < m; i++) {
-      const j = rev[i]
-      zr[j] = x[2 * i]
-      zi[j] = x[2 * i + 1]
+  for (let i = 0; i < n; i++) {
+    const j = rev[i]
+    if (j > i) {
+      const t = re[i]
+      re[i] = re[j]
+      re[j] = t
     }
-    // FFT compleja de tamaño m (iterativa, mariposas in-place); las tablas son de ángulo 2π/n, de ahí el paso n/size
-    for (let size = 2; size <= m; size <<= 1) {
-      const h = size >> 1
-      const step = n / size
-      for (let start = 0; start < m; start += size) {
-        for (let k = 0, w = 0; k < h; k++, w += step) {
-          const i = start + k
-          const j = i + h
-          const tr = zr[j] * cos[w] + zi[j] * sin[w]
-          const ti = zi[j] * cos[w] - zr[j] * sin[w]
-          zr[j] = zr[i] - tr
-          zi[j] = zi[i] - ti
-          zr[i] += tr
-          zi[i] += ti
-        }
+  }
+  for (let size = 2; size <= n; size <<= 1) {
+    const h = size >> 1
+    const step = n / size
+    for (let start = 0; start < n; start += size) {
+      for (let k = 0, w = 0; k < h; k++, w += step) {
+        const i = start + k
+        const j = i + h
+        const tr = re[j] * cos[w] + im[j] * sin[w]
+        const ti = im[j] * cos[w] - re[j] * sin[w]
+        re[j] = re[i] - tr
+        im[j] = im[i] - ti
+        re[i] += tr
+        im[i] += ti
       }
     }
-    // Separación de la señal real: X[k] = E[k] + W^k·O[k], con E y O sacados de Z[k] y Z[m-k]
-    mag[0] = Math.abs(zr[0] + zi[0])
-    for (let k = 1; k < m; k++) {
-      const a = zr[k]
-      const b = zi[k]
-      const c = zr[m - k]
-      const d = zi[m - k]
-      const er = 0.5 * (a + c)
-      const ei = 0.5 * (b - d)
-      const or = 0.5 * (b + d)
-      const oi = -0.5 * (a - c)
-      const re = er + cos[k] * or + sin[k] * oi
-      const im = ei + cos[k] * oi - sin[k] * or
-      mag[k] = Math.sqrt(re * re + im * im)
-    }
   }
-}
-
-/** Solo para pruebas: espectro de magnitudes (FFT_N/2 bins) de FFT_N muestras reales. */
-export function magnitudeSpectrum(frame: Float32Array): Float32Array {
-  const mag = new Float32Array(FFT_N / 2)
-  makeSpectrum()(frame, mag)
-  return mag
 }
 
 export function onsetEnvelope(mono: Float32Array, frames: number): { all: Float32Array; kick: Float32Array } {
@@ -182,10 +139,22 @@ export function onsetEnvelope(mono: Float32Array, frames: number): { all: Float3
   const half = new Float32Array(Math.floor(mono.length / 2))
   for (let i = 0; i < half.length; i++) half[i] = 0.5 * (mono[2 * i] + mono[2 * i + 1])
   const win = new Float32Array(n)
+  const cos = new Float32Array(n / 2)
+  const sin = new Float32Array(n / 2)
   for (let i = 0; i < n; i++) win[i] = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / n)
-  const spectrum = makeSpectrum()
-  const x = new Float32Array(n)
-  const mag = new Float32Array(n / 2)
+  for (let i = 0; i < n / 2; i++) {
+    cos[i] = Math.cos((2 * Math.PI * i) / n)
+    sin[i] = Math.sin((2 * Math.PI * i) / n)
+  }
+  const rev = new Uint16Array(n)
+  const bits = Math.log2(n)
+  for (let i = 0; i < n; i++) {
+    let r = 0
+    for (let b = 0; b < bits; b++) if (i & (1 << b)) r |= 1 << (bits - 1 - b)
+    rev[i] = r
+  }
+  const re = new Float32Array(n)
+  const im = new Float32Array(n)
   const prev = new Float32Array(n / 2)
   const flux = BAND_BINS.map(() => new Float32Array(frames))
   for (let f = 0; f < frames; f++) {
@@ -193,14 +162,15 @@ export function onsetEnvelope(mono: Float32Array, frames: number): { all: Float3
     const start = end - n
     for (let i = 0; i < n; i++) {
       const k = start + i
-      x[i] = k >= 0 && k < half.length ? half[k] * win[i] : 0
+      re[i] = k >= 0 && k < half.length ? half[k] * win[i] : 0
+      im[i] = 0
     }
-    spectrum(x, mag)
+    fftMags(re, im, cos, sin, rev)
     for (let bi = 0; bi < BAND_BINS.length; bi++) {
       const [b0, b1] = BAND_BINS[bi]
       let sum = 0
       for (let k = b0; k <= b1; k++) {
-        const l = Math.log1p(mag[k] * 20)
+        const l = Math.log1p(Math.sqrt(re[k] * re[k] + im[k] * im[k]) * 20)
         const d = l - prev[k]
         if (d > 0 && f > 0) sum += d
         prev[k] = l
@@ -225,10 +195,6 @@ export function onsetEnvelope(mono: Float32Array, frames: number): { all: Float3
 
 const MIN_BPM = 70
 const MAX_BPM = 180
-/** Al corregir la octava (mitad → doble) no se pasa de aquí: un hip-hop de 90 BPM con hi-hats a corcheas no debe saltar a 180, pero un drum & bass de 176 sí puede venir de 88. */
-const MAX_DOUBLE_BPM = 178
-/** Segundos centrales del tema con los que se puntúan los candidatos de tempo. */
-const SCORE_WINDOW_S = 180
 
 export interface BpmEstimate {
   bpm: number
@@ -240,9 +206,9 @@ export interface BpmEstimate {
 }
 
 /**
- * BPM: la autocorrelación del flujo espectral combinado de las 4 bandas (`env`) propone varios candidatos (picos) y
- * cada uno se PUNTÚA además con una rejilla de pulsos sobre bombo y bajo (`kick`, que también decide la octava): gana
- * el que mejor encaja. Así un pico espurio (p. ej. un bajo sincopado a 5/4 del pulso) no se impone a la rejilla real.
+ * BPM: la autocorrelación de los ataques de graves propone varios candidatos (picos) y cada uno se
+ * PUNTÚA contra la canción completa con una rejilla de pulsos (refineGrid): gana el que mejor encaja.
+ * Así un pico espurio (p. ej. un bajo sincopado a 5/4 del pulso) no se impone a la rejilla real.
  */
 export function estimateBpm(env: Float32Array, fps: number, kick: Float32Array = env): BpmEstimate | null {
   // `env` y `kick` ya son curvas de ataques (onsetEnvelope): con `env` se proponen candidatos y con `kick` se puntúan.
@@ -309,11 +275,7 @@ export function estimateBpm(env: Float32Array, fps: number, kick: Float32Array =
   const prior = (b: number) => Math.exp(-0.5 * Math.pow(Math.log2(b / 120) / 0.8, 2)) // leve preferencia por 120
   // Cada candidato se puntúa con la periodicidad (autocorrelación) y, de desempate, con qué tan bien encaja
   // una rejilla de pulsos sobre bombo y bajo en TODA la canción.
-  // Para puntuar candidatos basta la parte central (3 min como máximo): recorrer un mix de 25 min por cada candidato
-  // costaba ~7 veces el análisis anterior. El ajuste final sí recorre la canción entera.
-  const mid = Math.max(0, Math.floor((kick.length - SCORE_WINDOW_S * fps) / 2))
-  const scoreEnv = kick.subarray(mid, mid + Math.floor(SCORE_WINDOW_S * fps))
-  const grids = cands.map((c) => refineGrid(scoreEnv, fps, (60 * fps) / c.lag, { rel: 0.04 }))
+  const grids = cands.map((c) => refineGrid(kick, fps, (60 * fps) / c.lag, 0.04))
   const gmax = Math.max(1e-9, ...grids.map((g) => g.score))
   const results = cands.map((c, i) => {
     const g = grids[i]
@@ -334,7 +296,7 @@ export function estimateBpm(env: Float32Array, fps: number, kick: Float32Array =
   let lag = best.lag
   while (lag > 1) {
     const half = lag / 2
-    if (half < lagLo || (60 * fps) / half > MAX_DOUBLE_BPM) break
+    if (half < lagLo || (60 * fps) / half > 175) break // más de 175 BPM ya casi nunca es el pulso
     if (near(acKick, half) < 0.7 * near(acKick, lag)) break
     lag = half
   }
@@ -345,10 +307,7 @@ export function estimateBpm(env: Float32Array, fps: number, kick: Float32Array =
     if (Math.abs(r.bpm / bpmFinal - 1) > 0.04 && !alt.some((x) => Math.abs(x / v - 1) < 0.04)) alt.push(v)
     if (alt.length >= 3) break
   }
-  // Ajuste final sobre la canción entera en dos pasos: primero solo la FASE con el BPM fijo (así no se confunde con
-  // contratiempos) y luego un retoque de ±0,3 BPM sin dejar que la fase se aleje más de 30 ms de la ya elegida.
-  const g1 = refineGrid(kick, fps, bpmFinal, { abs: 0 })
-  const g = refineGrid(kick, fps, g1.bpm, { abs: 0.3 }, { center: g1.offset * fps, span: 0.03 * fps })
+  const g = refineGrid(kick, fps, bpmFinal, 1)
   return { bpm: Math.round(g.bpm * 10) / 10, offset: g.offset, conf, alt }
 }
 
@@ -358,15 +317,7 @@ export function estimateBpm(env: Float32Array, fps: number, kick: Float32Array =
  * `score` mide cuánta fuerza de ataque hay en los pulsos menos la mitad de la que hay a medio pulso
  * (penaliza rejillas a mitad de la velocidad real, donde los golpes quedan entre pulsos).
  */
-export function refineGrid(
-  onset: Float32Array,
-  fps: number,
-  bpm0: number,
-  /** Cuánto se prueba alrededor de bpm0: `rel` (fracción, p. ej. 0.04 = ±4 %) o `abs` (BPM). */
-  range: { rel?: number; abs?: number } = { rel: 1 / 120 },
-  /** Si se da, solo se prueban fases a ±span cuadros de center (cuadros): evita que un BPM ligeramente distinto «persiga» golpes lejanos. */
-  near?: { center: number; span: number },
-): { bpm: number; offset: number; score: number } {
+export function refineGrid(onset: Float32Array, fps: number, bpm0: number, span = 1 / 120): { bpm: number; offset: number; score: number } {
   const m = onset.length
   const on = onset
   // suavizado de 3 puntos: tolera medio cuadro de error
@@ -397,18 +348,15 @@ export function refineGrid(
     }
     return cnt ? sum / cnt : 0
   }
-  const delta = range.abs ?? bpm0 * (range.rel ?? 0)
-  const lo = bpm0 - delta
-  const hi = bpm0 + delta
+  const lo = span >= 1 ? bpm0 - span : bpm0 * (1 - span)
+  const hi = span >= 1 ? bpm0 + span : bpm0 * (1 + span)
   const step = Math.max(0.02, (hi - lo) / 100)
   let bestScore = -1
   let bestBpm = bpm0
   let bestPhase = 0
   for (let b = lo; b <= hi + 1e-6; b += step) {
     const P = (60 * fps) / b
-    for (let d = near ? -near.span : 0; d <= (near ? near.span : P); d += 0.5) {
-      const ph = near ? (((near.center + d) % P) + P) % P : d
-      if (!near && ph >= P) break
+    for (let ph = 0; ph < P; ph += 0.5) {
       let sum = 0
       let cnt = 0
       for (let t = ph; t < m - 1; t += P) {

@@ -231,7 +231,6 @@ func (s *Store) Copy(srcRel, dstRel string) error {
 	c.Cues = append([]Cue(nil), m.Cues...)
 	if m.Analysis != nil {
 		a := *m.Analysis
-		a.BpmAlt = append([]float64(nil), m.Analysis.BpmAlt...)
 		c.Analysis = &a
 		if data, err := os.ReadFile(s.waveFile(srcRel, a.Size)); err == nil {
 			_ = os.WriteFile(s.waveFile(dstRel, a.Size), data, 0o644)

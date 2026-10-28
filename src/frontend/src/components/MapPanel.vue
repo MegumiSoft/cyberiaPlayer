@@ -7,7 +7,7 @@ import { current, libraryToQueue, player, playIndex, setQueue } from '../player/
 import { compatScore, RELATION_LABEL, wheel, type Relation } from '../player/harmony'
 import { analyzeAll, batch, pendingTracks } from '../player/libanalysis'
 import { pal, rgba } from '../player/palette'
-import { gridOf, loadMetas, metas } from '../player/trackmeta'
+import { gridOf, metas } from '../player/trackmeta'
 import { playlistName } from '../player/trackops'
 import { loadLibrary, state, toast, trackUrl } from '../store'
 import type { LibPlaylist, LibTrack } from '../types'
@@ -31,7 +31,7 @@ const dlg = ref<InstanceType<typeof TrackDialogs>>()
 const notation = computed(() => state.settings?.keyNotation ?? 'camelot')
 
 const allTracks = computed(() => state.library.playlists.flatMap((p) => p.tracks))
-const pending = computed(() => pendingTracks(allTracks.value, state.durations).length)
+const pending = computed(() => pendingTracks(allTracks.value).length)
 
 const items = computed<Item[]>(() => {
   void metas // dependencia reactiva: se recalcula al terminar cada análisis
@@ -277,7 +277,7 @@ const trash = (it: Item) => dlg.value?.askTrash({ path: it.track.path, title: it
 
 async function startBatch() {
   if (!allTracks.value.length) return
-  await analyzeAll(allTracks.value, state.durations)
+  await analyzeAll(allTracks.value)
   if (!batch.cancel) toast(`Análisis terminado${batch.failed ? ` (${batch.failed} no se pudieron analizar)` : ''}`)
 }
 
@@ -345,9 +345,7 @@ async function saveSetAsPlaylist() {
   try {
     const res = await api.createPlaylistFromSet(name, setItems.value.map((it) => it.track.path))
     savingSet.value = false
-    // El backend copió rejilla y cues a las canciones nuevas: hay que recargar también la caché de metadatos, o al
-    // reproducir una del set se guardaría un registro en blanco encima de lo copiado.
-    await Promise.all([loadLibrary(), loadMetas()])
+    await loadLibrary()
     const skipped = res.skipped?.length ?? 0
     toast(`Playlist «${res.folder}» creada con ${res.copied} canciones${skipped ? ` (${skipped} no se pudieron copiar)` : ''}`, 7000)
   } catch (e) {

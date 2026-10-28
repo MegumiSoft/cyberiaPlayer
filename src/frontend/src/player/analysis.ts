@@ -19,35 +19,17 @@ export const needsBackendDecode = (t: { ext: string; size: number }): boolean =>
 
 let worker: Worker | null = null
 let workerBroken = false
-let nextId = 0
-const pending = new Map<number, { resolve: (a: Analysis) => void; reject: (e: Error) => void }>()
-
-function failPending(err: Error): void {
-  for (const p of pending.values()) p.reject(err)
-  pending.clear()
-}
 
 function getWorker(): Worker | null {
   if (workerBroken) return null
   if (worker) return worker
   try {
-    const w = new Worker(new URL('./analysis.worker.ts', import.meta.url), { type: 'module' })
-    // Un solo oyente para todas las peticiones: cada respuesta trae el id de la suya.
-    w.addEventListener('message', (e: MessageEvent<{ id: number; ok: boolean; res?: Analysis; error?: string }>) => {
-      const p = pending.get(e.data.id)
-      if (!p) return
-      pending.delete(e.data.id)
-      if (e.data.ok) p.resolve(e.data.res as Analysis)
-      else p.reject(new Error(e.data.error))
-    })
-    w.addEventListener('error', () => {
-      // El Worker no arrancó (p. ej. webview sin módulos): los pendientes fallan y los siguientes se calculan en el hilo principal.
+    worker = new Worker(new URL('./analysis.worker.ts', import.meta.url), { type: 'module' })
+    worker.addEventListener('error', () => {
       workerBroken = true
       worker = null
-      failPending(new Error('el Worker de análisis no está disponible'))
     })
-    worker = w
-    return w
+    return worker
   } catch {
     workerBroken = true
     return null
@@ -58,9 +40,21 @@ function runInWorker(mono: Float32Array): Promise<Analysis> {
   const w = getWorker()
   if (!w) return Promise.resolve().then(() => analyzeMono(mono, ANALYSIS_SR))
   return new Promise((resolve, reject) => {
-    const id = ++nextId
-    pending.set(id, { resolve, reject })
-    w.postMessage({ id, mono, sr: ANALYSIS_SR }, [mono.buffer])
+    const onMsg = (e: MessageEvent) => {
+      w.removeEventListener('message', onMsg)
+      w.removeEventListener('error', onErr)
+      if (e.data.ok) resolve(e.data.res as Analysis)
+      else reject(new Error(e.data.error))
+    }
+    const onErr = () => {
+      w.removeEventListener('message', onMsg)
+      w.removeEventListener('error', onErr)
+      // el Worker no arrancó (p. ej. webview sin módulos): se calcula en el hilo principal
+      resolve(analyzeMono(mono, ANALYSIS_SR))
+    }
+    w.addEventListener('message', onMsg)
+    w.addEventListener('error', onErr)
+    w.postMessage({ mono, sr: ANALYSIS_SR }, [mono.buffer])
   })
 }
 
@@ -80,49 +74,20 @@ export async function analyze(data: ArrayBuffer): Promise<Analysis> {
   return runInWorker(mono)
 }
 
-/** La interfaz ya no necesita este análisis (se saltó a otra canción o se detuvo el lote). */
-export class StaleAnalysis extends Error {
-  constructor() {
-    super('análisis descartado')
-  }
-}
-
-let handleSeq = 0
-const newHandle = (): string => `a${++handleSeq}-${Date.now().toString(36)}`
-
-/** El backend rechaza lo que dura más de 30 min (decode.ErrTooLong); este fragmento de su mensaje lo identifica. */
-export const isTooLongError = (e: unknown): boolean => String((e as { message?: string })?.message ?? e).includes('más de 30 minutos')
-
-/**
- * Analiza una canción que el backend decodifica con ffmpeg (PCM mono de 16 bits) y entrega por trozos.
- * `isStale` (opcional) se consulta mientras ffmpeg decodifica y entre trozos: si devuelve true se cancela ffmpeg, se
- * libera el PCM y se lanza StaleAnalysis (así saltar rápido entre canciones largas no deja decodificaciones corriendo).
- */
-export async function analyzeViaBackend(path: string, isStale?: () => boolean): Promise<Analysis> {
-  const handle = newHandle()
-  const poll = isStale
-    ? setInterval(() => {
-        if (isStale()) void api.cancelAnalysis(handle).catch(() => undefined)
-      }, 250)
-    : undefined
+/** Analiza una canción que el backend decodifica con ffmpeg (PCM mono de 16 bits) y entrega por trozos. */
+export async function analyzeViaBackend(path: string): Promise<Analysis> {
+  const total = await api.prepareAnalysis(path)
   try {
-    const total = await api.prepareAnalysis(handle, path).catch((e) => {
-      if (isStale?.()) throw new StaleAnalysis()
-      throw e
-    })
     const mono = new Float32Array(Math.floor(total / 2))
     let i = 0
     const CH = 4 * 1024 * 1024
     for (let off = 0; off < total; off += CH) {
-      if (isStale?.()) throw new StaleAnalysis()
-      const b = b64ToBytes(await api.readAnalysisChunk(handle, off, Math.min(CH, total - off)))
+      const b = b64ToBytes(await api.readAnalysisChunk(path, off, Math.min(CH, total - off)))
       const dv = new DataView(b.buffer, b.byteOffset, b.byteLength)
       for (let k = 0; k + 1 < b.byteLength && i < mono.length; k += 2) mono[i++] = dv.getInt16(k, true) / 32768
     }
-    if (isStale?.()) throw new StaleAnalysis()
     return await runInWorker(i === mono.length ? mono : mono.slice(0, i))
   } finally {
-    if (poll) clearInterval(poll)
-    void api.releaseAnalysis(handle).catch(() => undefined)
+    void api.releaseAnalysis(path).catch(() => undefined)
   }
 }

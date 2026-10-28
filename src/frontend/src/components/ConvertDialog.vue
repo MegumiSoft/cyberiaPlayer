@@ -1,146 +1,101 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { api } from '../api'
 import { errorText } from '../format'
 import { current, forgetTrack, stop } from '../player/engine'
-import { loadMetas } from '../player/trackmeta'
 import { loadLibrary, toast } from '../store'
-import type { ConvertFormat, ConvertFormatInfo, ConvertMode, ConvertProgress, ConvertResult, LibPlaylist } from '../types'
+import type { ConvertFormat, ConvertMode, ConvertProgress, ConvertResult, LibPlaylist } from '../types'
 
 // Convierte una playlist completa a otro formato (p. ej. WAV → MP3), conservando etiquetas, carátula, rejilla y cues.
-// La lista de formatos, sus calidades y qué extensiones son «con pérdida» las da el backend (ConvertFormats): no se duplican aquí.
-const formats = ref<ConvertFormatInfo[]>([])
-const lossyExts = ref<string[]>([])
+const FORMATS: { id: ConvertFormat; label: string; lossy: boolean; rates: number[]; def: number }[] = [
+  { id: 'mp3', label: 'MP3', lossy: true, rates: [320, 256, 192, 128], def: 320 },
+  { id: 'm4a', label: 'M4A (AAC)', lossy: true, rates: [320, 256, 192, 128], def: 256 },
+  { id: 'opus', label: 'OPUS', lossy: true, rates: [256, 192, 160, 128, 96], def: 160 },
+  { id: 'flac', label: 'FLAC', lossy: false, rates: [], def: 0 },
+  { id: 'wav', label: 'WAV', lossy: false, rates: [], def: 0 },
+]
+const LOSSY_EXT = ['mp3', 'm4a', 'aac', 'ogg', 'opus', 'wma']
 
 const pl = ref<LibPlaylist | null>(null)
 const format = ref<ConvertFormat>('mp3')
-const bitrate = ref<number | null>(null) // kbps de tasa fija (null = el predeterminado del formato)
-const vbr = ref<number | null>(null) // calidad VBR (solo MP3)
+const bitrate = ref(320)
 const mode = ref<ConvertMode>('keep')
 const newName = ref('')
 const nameTouched = ref(false)
 const working = ref(false)
-const confirming = ref(false)
 const progress = ref<ConvertProgress | null>(null)
 const result = ref<ConvertResult | null>(null)
 const error = ref('')
-const box = ref<HTMLElement>()
 let off: (() => void) | null = null
 
-const extOf = (t: { ext: string }) => t.ext.toLowerCase().replace('.', '')
-const fmt = computed(() => formats.value.find((f) => f.id === format.value))
-const fmtLabel = computed(() => (fmt.value?.label ?? format.value).split(' ')[0])
+const fmt = computed(() => FORMATS.find((f) => f.id === format.value)!)
 const tracks = computed(() => pl.value?.tracks ?? [])
-const todo = computed(() => tracks.value.filter((t) => extOf(t) !== format.value)) // las que hay que convertir
-const same = computed(() => tracks.value.length - todo.value.length) // las que ya están en el formato
-// En «playlist nueva» entran TODAS (las que ya están en el formato se copian tal cual); en los otros modos solo las que cambian.
-const rels = computed(() => (mode.value === 'playlist' ? tracks.value : todo.value).map((t) => t.path))
+const todo = computed(() => tracks.value.filter((t) => t.ext.toLowerCase().replace('.', '') !== format.value))
+const same = computed(() => tracks.value.length - todo.value.length)
 const breakdown = computed(() => {
   const n = new Map<string, number>()
   for (const t of tracks.value) {
-    const e = extOf(t).toUpperCase()
+    const e = t.ext.toLowerCase().replace('.', '').toUpperCase()
     n.set(e, (n.get(e) ?? 0) + 1)
   }
   return [...n].map(([e, c]) => `${c} ${e}`).join(' · ')
 })
-const hasLossySource = computed(() => todo.value.some((t) => lossyExts.value.includes(extOf(t))))
+const hasLossySource = computed(() => todo.value.some((t) => LOSSY_EXT.includes(t.ext.toLowerCase().replace('.', ''))))
 const warning = computed(() => {
-  if (!fmt.value) return ''
   if (!fmt.value.lossy && hasLossySource.value) return 'Pasar un MP3/M4A a FLAC o WAV no recupera calidad: el archivo solo pesa más.'
   if (fmt.value.lossy && hasLossySource.value) return 'Las canciones que ya eran con pérdida (MP3, M4A…) se vuelven a comprimir y pierden un poco más de calidad.'
   return ''
 })
-const defaultName = computed(() => `${pl.value?.name ?? ''} (${fmtLabel.value})`)
+const defaultName = computed(() => `${pl.value?.name ?? ''} (${fmt.value.label.split(' ')[0]})`)
 watch(defaultName, (v) => {
   if (!nameTouched.value) newName.value = v
 })
-watch(format, () => {
-  bitrate.value = fmt.value?.lossy ? fmt.value.default : null
-  vbr.value = null
-})
-watch([mode, format], () => (confirming.value = false))
-const pickRate = (r: number) => ((bitrate.value = r), (vbr.value = null))
-const pickVbr = (q: number) => ((vbr.value = q), (bitrate.value = null))
+watch(format, () => (bitrate.value = fmt.value.def))
 const pct = computed(() => (progress.value && progress.value.total ? (progress.value.done / progress.value.total) * 100 : 0))
 const sizeText = (n: number) => (n >= 1e9 ? (n / 1e9).toFixed(2) + ' GB' : (n / 1e6).toFixed(0) + ' MB')
-const canGo = computed(() => !working.value && !!fmt.value && rels.value.length > 0 && (mode.value !== 'playlist' || newName.value.trim().length > 0))
+const canGo = computed(() => !working.value && todo.value.length > 0 && (mode.value !== 'playlist' || newName.value.trim().length > 0))
 
-async function open(p: LibPlaylist) {
-  if (!formats.value.length) {
-    try {
-      const info = await api.convertFormats()
-      formats.value = info.formats
-      lossyExts.value = info.lossyExts
-    } catch (e) {
-      toast(errorText(e))
-      return
-    }
-  }
+function open(p: LibPlaylist) {
   pl.value = p
-  // Si todo es con pérdida, FLAC/WAV solo harían crecer los archivos sin mejorar nada: M4A es el valor por defecto menos dañino.
-  const hasLossless = p.tracks.some((t) => !lossyExts.value.includes(extOf(t)))
-  format.value = hasLossless ? 'mp3' : 'm4a'
-  bitrate.value = fmt.value?.default ?? null
-  vbr.value = null
+  const lossless = p.tracks.some((t) => !LOSSY_EXT.includes(t.ext.toLowerCase().replace('.', '')))
+  format.value = lossless ? 'mp3' : 'flac'
+  bitrate.value = fmt.value.def
   mode.value = 'keep'
-  confirming.value = false
   nameTouched.value = false
   newName.value = defaultName.value
   result.value = null
   error.value = ''
   progress.value = null
-  await nextTick()
-  box.value?.focus() // sin foco, Esc no llega al diálogo hasta que se hace clic dentro
 }
 function close() {
   if (!working.value) pl.value = null
 }
 
-// Con «Reemplazarlos» primero se pide confirmación (se mandan N originales a la papelera).
-function start() {
-  if (!canGo.value) return
-  if (mode.value === 'replace' && !confirming.value) {
-    confirming.value = true
-    return
-  }
-  void run()
-}
-
 async function run() {
   const p = pl.value
   if (!p || !canGo.value) return
-  confirming.value = false
   working.value = true
   error.value = ''
-  progress.value = { done: 0, total: rels.value.length, current: '' }
+  progress.value = { done: 0, total: todo.value.length, current: '' }
   off = api.onConvert((e) => (progress.value = e))
-  const list = rels.value
+  const rels = todo.value.map((t) => t.path)
   try {
-    // En Windows un archivo en uso no se puede mandar a la papelera, así que se suelta el que esté sonando. Los 250 ms
-    // son una estimación de lo que tarda el sistema en liberarlo; si algo más lo retiene (una precarga o un análisis en
-    // el backend), esa canción acaba en «fallaron» con el motivo: no es peligroso, solo puede requerir reintentar.
+    // En Windows un archivo en uso no se puede mandar a la papelera: se suelta el que esté sonando.
     if (mode.value === 'replace') {
       const cur = current()
-      if (cur && list.includes(cur.track.path)) {
+      if (cur && rels.includes(cur.track.path)) {
         stop()
         await new Promise((r) => setTimeout(r, 250))
       }
     }
-    const res = await api.convertTracks({
-      rels: list,
-      format: format.value,
-      bitrate: fmt.value?.lossy ? bitrate.value : null,
-      vbr: fmt.value?.lossy ? vbr.value : null,
-      mode: mode.value,
-      newName: newName.value.trim(),
-    })
+    const res = await api.convertTracks({ rels, format: format.value, bitrate: bitrate.value, mode: mode.value, newName: newName.value.trim() })
     result.value = res
-    if (mode.value === 'replace') list.forEach(forgetTrack)
-    // El backend ya copió rejilla, cues y análisis a los archivos nuevos: hay que recargar también la caché de metadatos,
-    // o la interfaz no los conoce y al reproducir una canción nueva guardaría un registro en blanco encima de lo copiado.
-    await Promise.all([loadLibrary(), loadMetas()])
+    if (mode.value === 'replace') rels.forEach(forgetTrack)
+    await loadLibrary()
     toast(
-      res.canceled ? `Conversión detenida: ${res.converted} canciones convertidas` : `${res.converted} canciones convertidas a ${fmtLabel.value}`,
+      res.canceled
+        ? `Conversión detenida: ${res.converted} canciones convertidas`
+        : `${res.converted} canciones convertidas a ${fmt.value.label.split(' ')[0]}`,
       6000,
     )
   } catch (e) {
@@ -162,8 +117,8 @@ defineExpose({ open })
 
 <template>
   <Teleport to="body">
-    <div v-if="pl" class="modal" @mousedown.self="close">
-      <div ref="box" class="dialog convdlg" role="dialog" aria-label="Convertir playlist" tabindex="-1" @keydown="onKey">
+    <div v-if="pl" class="modal" @mousedown.self="close" @keydown="onKey">
+      <div class="dialog convdlg" role="dialog" aria-label="Convertir playlist" tabindex="-1">
         <div class="cap">Convertir playlist</div>
         <div class="dlg-title">{{ pl.name }}</div>
         <div class="hint" style="margin-bottom: 8px">{{ tracks.length }} CANCIONES · {{ breakdown }}</div>
@@ -171,22 +126,17 @@ defineExpose({ open })
         <template v-if="!result">
           <div class="label">Convertir a</div>
           <div class="row" style="flex-wrap: wrap; gap: 6px">
-            <button v-for="f in formats" :key="f.id" class="tog m" :class="{ on: format === f.id }" :disabled="working" @click="format = f.id">{{ f.label }}</button>
+            <button v-for="f in FORMATS" :key="f.id" class="tog m" :class="{ on: format === f.id }" :disabled="working" @click="format = f.id">{{ f.label }}</button>
           </div>
-          <div v-if="fmt?.lossy" class="row" style="margin-top: 8px; gap: 6px; flex-wrap: wrap">
+          <div v-if="fmt.lossy" class="row" style="margin-top: 8px; gap: 6px; flex-wrap: wrap">
             <span class="hint">CALIDAD</span>
-            <button v-for="r in fmt.bitrates" :key="r" class="tog m" :class="{ on: bitrate === r }" :disabled="working" @click="pickRate(r)">{{ r }} kbps</button>
-            <button v-for="q in fmt.vbr" :key="'v' + q" class="tog m" :class="{ on: vbr === q }" :disabled="working" title="Tasa variable: mejor calidad por tamaño" @click="pickVbr(q)">V{{ q }} · VBR</button>
+            <button v-for="r in fmt.rates" :key="r" class="tog m" :class="{ on: bitrate === r }" :disabled="working" @click="bitrate = r">{{ r }} kbps</button>
           </div>
           <div v-else class="hint" style="margin-top: 8px">SIN PÉRDIDA: SE CONSERVA LA PROFUNDIDAD DE BITS DEL ORIGINAL</div>
           <div class="hint" style="margin-top: 6px">
-            <template v-if="mode === 'playlist'">SE CONVIERTEN <b>{{ todo.length }}</b><template v-if="same"> · {{ same }} YA SON {{ fmtLabel }} Y SE COPIAN TAL CUAL</template></template>
-            <template v-else>SE CONVIERTEN <b>{{ todo.length }}</b><template v-if="same"> · {{ same }} YA SON {{ fmtLabel }} Y SE DEJAN</template></template>
+            SE CONVIERTEN <b>{{ todo.length }}</b><template v-if="same"> · {{ same }} YA SON {{ fmt.label.split(' ')[0] }} Y SE DEJAN</template>
           </div>
           <div v-if="warning" class="warn" style="margin-top: 8px">{{ warning }}</div>
-          <div v-if="fmt?.lossy" class="hint" style="margin-top: 6px">
-            LOS CODIFICADORES CON PÉRDIDA AÑADEN ~25 MS DE RELLENO AL INICIO; LOS REPRODUCTORES CON «GAPLESS» LO DESCUENTAN. SI EL TUYO NO, REVISA LA REJILLA CON «AJUSTAR AL GOLPE».
-          </div>
 
           <div class="label" style="margin-top: 12px">¿Qué hacer con los originales?</div>
           <label class="convopt" :class="{ on: mode === 'keep' }">
@@ -195,7 +145,7 @@ defineExpose({ open })
           </label>
           <label class="convopt" :class="{ on: mode === 'playlist' }">
             <input v-model="mode" type="radio" value="playlist" :disabled="working" />
-            <span><b>Crear una playlist nueva</b> con todas las canciones (las que ya están en el formato se copian tal cual). La actual no se toca.</span>
+            <span><b>Crear una playlist nueva</b> solo con los convertidos. La actual no se toca.</span>
           </label>
           <input
             v-if="mode === 'playlist'"
@@ -206,7 +156,7 @@ defineExpose({ open })
             spellcheck="false"
             :disabled="working"
             @input="nameTouched = true"
-            @keydown.enter="start"
+            @keydown.enter="run"
           />
           <label class="convopt" :class="{ on: mode === 'replace' }">
             <input v-model="mode" type="radio" value="replace" :disabled="working" />
@@ -218,18 +168,12 @@ defineExpose({ open })
             <div class="hint" style="margin-top: 4px">{{ progress.done }}/{{ progress.total }} · {{ progress.current || '…' }}</div>
           </div>
           <div v-if="error" class="error" style="margin-top: 8px">{{ error }}</div>
-          <div v-if="confirming" class="warn" style="margin-top: 10px">
-            Se enviarán <b>{{ rels.length }}</b> originales a la papelera del sistema cuando su versión convertida esté lista. Si el original ya tenía pérdida, esa calidad no se recupera al vaciar la papelera. ¿Continuar?
-          </div>
           <div class="row spread" style="margin-top: 12px">
             <span class="hint">{{ working ? 'CONVIRTIENDO… NO CIERRES LA APP' : 'NUNCA SOBRESCRIBE: SI YA EXISTE, SE OMITE' }}</span>
             <span class="row">
-              <button v-if="confirming" class="btn small" @click="confirming = false">Volver</button>
-              <button v-else-if="!working" class="btn small" @click="close">Cancelar</button>
+              <button v-if="!working" class="btn small" @click="close">Cancelar</button>
               <button v-else class="btn small danger" @click="cancel">Detener</button>
-              <button class="btn small primary" :class="{ danger: confirming }" :disabled="!canGo" @click="start">
-                <i v-if="working" class="spin" /> {{ confirming ? 'Sí, convertir y reemplazar' : `Convertir ${rels.length}` }}
-              </button>
+              <button class="btn small primary" :disabled="!canGo" @click="run"><i v-if="working" class="spin" /> Convertir {{ todo.length }}</button>
             </span>
           </div>
         </template>
@@ -240,7 +184,6 @@ defineExpose({ open })
               CONVERTIDAS: <b>{{ result.converted }}</b><template v-if="result.canceled"> (DETENIDO A MEDIAS)</template>
               <template v-if="result.converted"> · {{ sizeText(result.bytesBefore) }} → {{ sizeText(result.bytesAfter) }}</template>
             </div>
-            <div v-if="result.copied">COPIADAS TAL CUAL (YA ERAN {{ fmtLabel }}): <b>{{ result.copied }}</b></div>
             <div v-if="result.folder">PLAYLIST NUEVA: <b>{{ result.folder }}</b></div>
             <div v-if="result.trashed">ORIGINALES EN LA PAPELERA: <b>{{ result.trashed }}</b></div>
             <div v-if="result.skipped?.length" class="hint" style="margin-top: 6px">OMITIDAS ({{ result.skipped.length }})</div>

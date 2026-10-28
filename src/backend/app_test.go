@@ -6,12 +6,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 	"testing"
-	"time"
 
-	"musicdl/src/backend/decode"
 	"musicdl/src/backend/queue"
 	"musicdl/src/backend/ytdlp"
 )
@@ -20,7 +17,6 @@ func testApp(t *testing.T) *App {
 	t.Helper()
 	dir := t.TempDir()
 	t.Setenv("HOME", dir)
-	t.Setenv("XDG_DATA_HOME", filepath.Join(dir, "share")) // la papelera de Linux cuelga de aquí: que no toque la del desarrollador
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(dir, "cfg"))
 	t.Setenv("AppData", filepath.Join(dir, "cfg"))
 	a := NewApp()
@@ -214,22 +210,6 @@ func TestCopyTrackKeepsOriginalAndMeta(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(root, "A", "dos.flac")); err != nil {
 		t.Fatal("el original desapareció")
 	}
-	// Títulos que empiezan con números NO se tocan; solo el prefijo «NN - ».
-	for _, n := range []string{"24K Magic", "808s", "4 Minutes", "50 Cent - In Da Club", "99 Luftballons", "03 - Con prefijo"} {
-		os.WriteFile(filepath.Join(root, "A", n+".mp3"), []byte("x"), 0o644)
-	}
-	res2, err := a.CreatePlaylistFromSet("Números", []string{"A/24K Magic.mp3", "A/808s.mp3", "A/4 Minutes.mp3", "A/50 Cent - In Da Club.mp3", "A/99 Luftballons.mp3", "A/03 - Con prefijo.mp3"})
-	if err != nil || res2.Copied != 6 {
-		t.Fatalf("set con números: %+v %v", res2, err)
-	}
-	ents2, _ := os.ReadDir(filepath.Join(root, res2.Folder))
-	var names2 []string
-	for _, e := range ents2 {
-		names2 = append(names2, e.Name())
-	}
-	if want := "01 - 24K Magic.mp3|02 - 808s.mp3|03 - 4 Minutes.mp3|04 - 50 Cent - In Da Club.mp3|05 - 99 Luftballons.mp3|06 - Con prefijo.mp3"; strings.Join(names2, "|") != want {
-		t.Fatalf("nombres con números:\n got %v\nwant %s", names2, want)
-	}
 	if _, err := a.CreatePlaylistFromSet("Mi set: viernes", []string{"A/uno.mp3"}); err == nil {
 		t.Fatal("debió negarse: la playlist ya existe")
 	}
@@ -252,11 +232,6 @@ func TestConvertTracks(t *testing.T) {
 		t.Fatal(err)
 	}
 	a.yt.SetFFmpegPath(ff)
-	// La papelera real (y en macOS el Finder) no se toca desde los tests: se simula quitando el archivo.
-	var trashed []string
-	oldTrash := trashFile
-	trashFile = func(p string) error { trashed = append(trashed, filepath.Base(p)); return os.Remove(p) }
-	t.Cleanup(func() { trashFile = oldTrash })
 	os.MkdirAll(filepath.Join(root, "A"), 0o755)
 	wav := filepath.Join(root, "A", "uno.wav")
 	if out, err := exec.Command(ff, "-v", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=2:sample_rate=44100", "-y", wav).CombinedOutput(); err != nil {
@@ -302,22 +277,9 @@ func TestConvertTracks(t *testing.T) {
 	if _, err := a.ConvertTracks(ConvertRequest{Rels: both, Format: "flac", Mode: "playlist", NewName: "Flacs"}); err == nil {
 		t.Fatal("playlist: debió negarse a reutilizar una carpeta existente")
 	}
-	// la playlist nueva queda COMPLETA: lo que ya es MP3 se copia tal cual (con su rejilla) y lo demás se convierte
-	res, err = a.ConvertTracks(ConvertRequest{Rels: both, Format: "mp3", Mode: "playlist", NewName: "Mp3s"})
-	if err != nil || res.Converted != 1 || res.Copied != 1 || len(res.Skipped) != 0 || len(res.Failed) != 0 {
-		t.Fatalf("playlist completa: %+v %v", res, err)
-	}
-	for _, p := range []string{"Mp3s/uno.mp3", "Mp3s/dos.mp3"} {
-		if _, err := os.Stat(filepath.Join(root, p)); err != nil {
-			t.Fatalf("playlist completa: falta %s", p)
-		}
-	}
-	if g := a.meta.All()["Mp3s/uno.mp3"]; !g.GridSet || g.GridBPM != 128 {
-		t.Fatalf("playlist completa: la convertida debe heredar la rejilla: %+v", g)
-	}
-	// si no se pudo convertir ni copiar nada no queda carpeta vacía
-	res, _ = a.ConvertTracks(ConvertRequest{Rels: []string{"A/no-existe.mp3"}, Format: "flac", Mode: "playlist", NewName: "Vacia"})
-	if res.Converted+res.Copied != 0 || len(res.Failed) != 1 || res.Folder != "" {
+	// si nada se convierte no queda carpeta vacía
+	res, _ = a.ConvertTracks(ConvertRequest{Rels: []string{"A/dos.mp3"}, Format: "mp3", Mode: "playlist", NewName: "Vacia"})
+	if res.Converted != 0 || res.Folder != "" {
 		t.Fatalf("vacía: %+v", res)
 	}
 	if _, err := os.Stat(filepath.Join(root, "Vacia")); err == nil {
@@ -338,27 +300,6 @@ func TestConvertTracks(t *testing.T) {
 	if _, ok := a.meta.All()["A/uno.wav"]; ok {
 		t.Fatal("replace: los metadatos del original deben limpiarse")
 	}
-	if len(trashed) != 1 || trashed[0] != "uno.wav" {
-		t.Fatalf("replace: debió mandar uno.wav a la papelera: %v", trashed)
-	}
-
-	// calidad: VBR en MP3 y tasa fija válidas; fuera de lista se rechaza antes de empezar
-	v2, br96, br := 2, 96, 256
-	if res, err := a.ConvertTracks(ConvertRequest{Rels: []string{"A/dos.mp3"}, Format: "m4a", Bitrate: &br, Mode: "keep"}); err != nil || res.Converted != 1 {
-		t.Fatalf("m4a 256: %+v %v", res, err)
-	}
-	if res, err := a.ConvertTracks(ConvertRequest{Rels: []string{"Mp3s/uno.mp3"}, Format: "opus", Bitrate: &br96, Mode: "keep"}); err != nil || res.Converted != 1 {
-		t.Fatalf("opus 96: %+v %v", res, err)
-	}
-	if res, err := a.ConvertTracks(ConvertRequest{Rels: []string{"A/uno.m4a"}, Format: "mp3", VBR: &v2, Mode: "playlist", NewName: "V2"}); err != nil || res.Converted != 1 {
-		t.Fatalf("mp3 V2: %+v %v", res, err)
-	}
-	if _, err := a.ConvertTracks(ConvertRequest{Rels: both, Format: "mp3", Bitrate: &br96, Mode: "keep"}); err == nil {
-		t.Fatal("96 kbps no existe en MP3: debió rechazarse")
-	}
-	if info := a.ConvertFormats(); len(info.Formats) == 0 || len(info.LossyExts) == 0 {
-		t.Fatalf("ConvertFormats vacío: %+v", info)
-	}
 
 	// validaciones
 	for _, bad := range []ConvertRequest{
@@ -372,75 +313,5 @@ func TestConvertTracks(t *testing.T) {
 	}
 	if res, _ := a.ConvertTracks(ConvertRequest{Rels: []string{"../fuera.wav"}, Format: "mp3", Mode: "keep"}); res.Converted != 0 || len(res.Failed) != 1 {
 		t.Fatalf("ruta fuera de la biblioteca: %+v", res)
-	}
-}
-
-func TestAnalysisHandlesDoNotCollide(t *testing.T) {
-	ff, err := exec.LookPath("ffmpeg")
-	if err != nil {
-		t.Skip("ffmpeg no está instalado")
-	}
-	a := testApp(t)
-	root := t.TempDir()
-	cur := a.settings.Get()
-	cur.OutDir = root
-	if _, err := a.settings.Set(cur); err != nil {
-		t.Fatal(err)
-	}
-	a.yt.SetFFmpegPath(ff)
-	os.MkdirAll(filepath.Join(root, "A"), 0o755)
-	wav := filepath.Join(root, "A", "uno.wav")
-	if out, err := exec.Command(ff, "-v", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=2:sample_rate=44100", "-y", wav).CombinedOutput(); err != nil {
-		t.Fatalf("%v %s", err, out)
-	}
-
-	// Dos análisis de la MISMA canción a la vez: cada uno con su archivo.
-	var n1, n2 int64
-	var e1, e2 error
-	done := make(chan struct{}, 2)
-	go func() { n1, e1 = a.PrepareAnalysis("h1", "A/uno.wav"); done <- struct{}{} }()
-	go func() { n2, e2 = a.PrepareAnalysis("h2", "A/uno.wav"); done <- struct{}{} }()
-	<-done
-	<-done
-	if e1 != nil || e2 != nil || n1 == 0 || n1 != n2 {
-		t.Fatalf("h1=%d,%v h2=%d,%v", n1, e1, n2, e2)
-	}
-	if _, err := a.PrepareAnalysis("h1", "A/uno.wav"); err == nil {
-		t.Fatal("un handle repetido debe rechazarse")
-	}
-	a.ReleaseAnalysis("h1") // liberar uno no toca al otro
-	b, err := a.ReadAnalysisChunk("h2", 0, 1024)
-	if err != nil || len(b) != 1024 {
-		t.Fatalf("h2 debía seguir legible: %d %v", len(b), err)
-	}
-	if _, err := a.ReadAnalysisChunk("h1", 0, 1024); err == nil {
-		t.Fatal("h1 ya no existe")
-	}
-	// Más allá del final: trozo vacío, no error.
-	if b, err := a.ReadAnalysisChunk("h2", n2+10, 1024); err != nil || len(b) != 0 {
-		t.Fatalf("EOF: %d %v", len(b), err)
-	}
-	a.ReleaseAnalysis("h2")
-	if m, _ := filepath.Glob(filepath.Join(a.pcmDir(), "*.pcm")); len(m) != 0 {
-		t.Fatalf("quedaron temporales: %v", m)
-	}
-
-	// Cancelar mientras decodifica (o justo al terminar) nunca deja archivos ni un handle colgado.
-	go func() { time.Sleep(10 * time.Millisecond); a.CancelAnalysis("h3") }()
-	_, _ = a.PrepareAnalysis("h3", "A/uno.wav")
-	a.ReleaseAnalysis("h3")
-	if m, _ := filepath.Glob(filepath.Join(a.pcmDir(), "*.pcm")); len(m) != 0 {
-		t.Fatalf("tras cancelar quedaron temporales: %v", m)
-	}
-
-	// Más de 30 min: se rechaza sin decodificar y se recuerda.
-	long := filepath.Join(root, "A", "mix.wav")
-	if out, err := exec.Command(ff, "-v", "error", "-f", "lavfi", "-i", "anullsrc=r=8000:cl=mono", "-t", "1860", "-y", long).CombinedOutput(); err != nil {
-		t.Fatalf("%v %s", err, out)
-	}
-	for i := 0; i < 2; i++ {
-		if _, err := a.PrepareAnalysis("h4"+strconv.Itoa(i), "A/mix.wav"); err != decode.ErrTooLong {
-			t.Fatalf("intento %d: %v", i, err)
-		}
 	}
 }

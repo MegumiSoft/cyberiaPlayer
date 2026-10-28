@@ -94,12 +94,12 @@ async function create() {
   }
 }
 
-const pending = computed(() => (pl.value ? pendingTracks(pl.value.tracks, state.durations).length : 0))
+const pending = computed(() => (pl.value ? pendingTracks(pl.value.tracks).length : 0))
 const unanalyzed = computed(() => (pl.value ? pl.value.tracks.filter((t) => !isAnalyzed(t)).length : 0))
 async function analyzeList() {
   const p = pl.value
   if (!p || batch.running) return
-  await analyzeAll(p.tracks, state.durations)
+  await analyzeAll(p.tracks)
   if (!batch.cancel) toast(`Análisis terminado${batch.failed ? ` (${batch.failed} no se pudieron analizar)` : ''}`)
 }
 
